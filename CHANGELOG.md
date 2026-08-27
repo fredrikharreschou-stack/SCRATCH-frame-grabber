@@ -2,6 +2,15 @@
 
 All notable changes to SCRATCH Frame Grabber are documented here.
 
+## 1.4.2 - 2026-08-27
+
+### Added
+- A `\` or `/` in the naming pattern is now a folder boundary, matching
+  SCRATCH's own naming/output module — `\#group\#construct\#name.#ext`
+  writes into a `<group>/<construct>/` subfolder tree instead of one flat
+  folder. Each segment between separators is sanitized on its own, and
+  the app creates whatever subfolders the pattern calls for.
+
 ## 1.4.1 - 2026-08-26
 
 ### Fixed

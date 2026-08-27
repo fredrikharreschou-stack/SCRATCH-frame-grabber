@@ -514,6 +514,31 @@ def sanitize_full_filename(text):
     return cleaned or "shot"
 
 
+PATH_SEPARATORS_RE = re.compile(r"[\\/]+")
+
+
+def render_pattern_segments(rendered):
+    """Split a rendered naming pattern into path segments.
+
+    SCRATCH's own naming/output module treats "\\" (and "/") in a naming
+    pattern as a folder boundary -- e.g. "\\#group\\#construct\\#name"
+    writes into a <group>/<construct>/ subfolder tree instead of one flat
+    folder. Frame Grabber's naming pattern now honors the same
+    convention. Each segment between separators is sanitized on its own
+    -- so a stray character in one folder's name can't leak into the
+    next -- and a leading/doubled separator (patterns SCRATCH itself
+    writes with a leading "\\") just means "nothing there", not an
+    empty-named folder.
+
+    Returns a non-empty list of sanitized segments; the caller treats the
+    last one as the filename and the rest as folders to create.
+    """
+    raw_segments = [s for s in PATH_SEPARATORS_RE.split(rendered) if s.strip(" ._")]
+    if not raw_segments:
+        return ["shot"]
+    return [sanitize_full_filename(s) for s in raw_segments]
+
+
 def pick_snapshot_frame(shot, frame_choice):
     """The ImageSnapshot API's `frame` is a frame number into the shot's
     *source media*, not a position within the timeline -- so frame 0 is
@@ -891,7 +916,8 @@ class FrameGrabberApp(ctk.CTk):
             card,
             text=(
                 "Uses SCRATCH's own #flag syntax, e.g. #reelid_#scene_#take_#name. Flags\n"
-                "SCRATCH offers that this API can't supply yet are simply left blank."
+                "SCRATCH offers that this API can't supply yet are simply left blank. A \\ or /\n"
+                "in the pattern creates subfolders, e.g. \\#group\\#construct\\#name.#ext."
             ),
             justify="left",
             font=ctk.CTkFont(size=11),
@@ -1496,10 +1522,17 @@ class FrameGrabberApp(ctk.CTk):
             rendered, unknown_flags, unsupported_flags = render_naming_pattern(naming_pattern, ctx)
             all_unknown |= unknown_flags
             all_unsupported |= unsupported_flags
+            # A "\" or "/" in the pattern is a folder boundary (matching
+            # SCRATCH's own naming module), so #group\#construct\#name
+            # writes into a <group>/<construct>/ subfolder tree. Only the
+            # last segment is the filename -- everything before it is
+            # folders to create under out_dir.
+            segments = render_pattern_segments(rendered)
+            stem = segments[-1]
+            folders = segments[:-1]
             # Without the running number the filename is whatever the pattern
             # produces, which stays stable from run to run -- so re-grabbing a
             # day overwrites its stills instead of leaving renumbered orphans.
-            stem = sanitize_full_filename(rendered)
             if settings.get("number_prefix", True):
                 stem = f"{seq:02d}_{stem}"
             # The naming pattern may already end with a literal ".#ext" (as
@@ -1509,12 +1542,16 @@ class FrameGrabberApp(ctk.CTk):
             # it appended a second time.
             suffix = f".{ext}"
             filename = stem if stem.lower().endswith(suffix.lower()) else stem + suffix
+            rel_parts = folders + [filename]
             out_path = unique_path(
-                os.path.join(out_dir, filename),
+                os.path.join(out_dir, *rel_parts),
                 self._used_paths,
             )
             self._used_paths.add(out_path)
-            fname = os.path.basename(out_path)
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            # Posix-style ("/") even on Windows -- this is a relative href
+            # for the HTML gallery, not a filesystem path.
+            fname = "/".join(rel_parts)
 
             try:
                 app_api.do_application_render_snapshot(
