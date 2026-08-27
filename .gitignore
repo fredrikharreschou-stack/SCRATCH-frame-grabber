@@ -1,0 +1,25 @@
+# Local, per-user settings (output folder, format, naming pattern, ...)
+scratch_frame_grabber_settings.json
+
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller build output
+build/
+dist/
+
+# Generated icons (regenerate with make_app_icon.py / build-macos/make_icon.py)
+icon.icns
+icon_512.png
+icon_1024.png
+icon.iconset/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editors / venvs
+.vscode/
+venv/
+.venv/
