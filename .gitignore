@@ -23,3 +23,6 @@ Thumbs.db
 .vscode/
 venv/
 .venv/
+
+# Old version snapshots kept locally for reference, not tracked in git
+legacy/

@@ -1,0 +1,36 @@
+--- /mnt/user-data/uploads/cleaudeScrathc/SCRATCH-Frame-Grabber-macOS-handoff/scratch_frame_grabber.py	2026-08-26 11:44:36.084805309 +0000
++++ /tmp/scratch-scripts/scratch_frame_grabber.py	2026-08-26 12:13:27.920908254 +0000
+@@ -302,8 +302,15 @@
+ 
+ 
+ def _h_file(ctx, params):
++    # os.path.splitext only strips the LAST extension. Some sources come
++    # back from SCRATCH with a compound extension on the filename itself
++    # (e.g. a JPEG proxy named "...p1F9V.jpg.jpg") -- splitext would leave
++    # one ".jpg" behind, which then collides with a literal ".#ext" at the
++    # end of the naming pattern. Strip everything from the first dot
++    # instead, since a source filename's "name" portion essentially never
++    # contains a literal dot of its own.
+     f = ctx["shot"].file or ""
+-    base = os.path.splitext(os.path.basename(f))[0] if f else ""
++    base = os.path.basename(f).split(".", 1)[0] if f else ""
+     return _slice_chars(base, params)
+ 
+ 
+@@ -1495,8 +1502,15 @@
+             stem = sanitize_full_filename(rendered)
+             if settings.get("number_prefix", True):
+                 stem = f"{seq:02d}_{stem}"
++            # The naming pattern may already end with a literal ".#ext" (as
++            # documented -- #ext is meant to be usable inside a pattern).
++            # Only append the extension ourselves when the pattern didn't
++            # already supply one, so a pattern ending in ".#ext" doesn't get
++            # it appended a second time.
++            suffix = f".{ext}"
++            filename = stem if stem.lower().endswith(suffix.lower()) else stem + suffix
+             out_path = unique_path(
+-                os.path.join(out_dir, f"{stem}.{ext}"),
++                os.path.join(out_dir, filename),
+                 self._used_paths,
+             )
+             self._used_paths.add(out_path)
