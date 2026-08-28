@@ -2,6 +2,59 @@
 
 All notable changes to SCRATCH Frame Grabber are documented here.
 
+## 1.4.3 - 2026-08-28
+
+Built on 1.4.2. Verified against a live SCRATCH 9.9 (build 1211) on an
+8-group, 580-slot project.
+
+### Added
+- "Grab this group" button, alongside the open-timeline and whole-project
+  grabs. Takes every timeline in the group the open timeline belongs to —
+  for finishing a shooting day when the earlier days are already captured.
+  It writes into the same `<output>/<group>/` folder a whole-project run
+  uses, so a day grabbed on its own sits alongside days grabbed earlier
+  instead of forming a parallel tree. A group chosen this way is never
+  skipped for its name, and a single-group run does not overwrite the
+  project-wide `gallery.html`.
+- "Skip clips missing any of these flags", with the field pre-filled
+  `#scene #take`. Accepts any naming flag, so `#reelid` works, or `#file`
+  to drop shots whose media has gone offline. A clip is skipped when *any*
+  listed flag renders empty. Unrecognised flag names are reported and
+  ignored; if nothing in the field is recognised the run skips nothing on
+  that basis, rather than dropping every clip on a typo.
+- "…and keep them in an `unslated` subfolder instead of skipping". Diverted
+  clips get their own folder inside the group folder, their own numbering
+  and their own `gallery.html`, and are left out of the main contact sheet.
+  Unslated is not always unwanted — pickups, inserts, plates and B-roll
+  often run long without a slate, exactly like a blooper does.
+
+### Fixed
+- The gallery `href` for a frame is now derived from the path actually
+  written, rather than rebuilt from the pattern segments. When the in-run
+  collision guard renames a file (appending " 2" where two frames resolve
+  to the same name), the segment-built href pointed at the un-renamed path
+  and the gallery showed a broken image. Narrow, but the 1.4.2 subfolder
+  feature makes same-name collisions more likely rather than less.
+- The in-run collision guard was also counting files left by an *earlier*
+  run as taken, so re-grabbing a day already captured produced a second
+  copy of every still instead of refreshing it in place. Only names claimed
+  within the current run are considered.
+- A naming pattern that renders to nothing but its literal separators —
+  `#scene_#take` on an unslated clip renders as `_` — was reduced by the
+  sanitizer to its "shot" fallback, so every such clip collided on one
+  filename. The check now looks for real characters and falls back to the
+  clip's own name. It runs before the pattern is split into path segments,
+  so the fallback lands in the filename instead of inventing a folder.
+
+### Notes
+- Pattern subfolders stack with the per-group folders a group or project
+  run already creates: `\#group\#name` under a project run yields
+  `<group>/<group>/<name>`. Working as designed, but easy to trip over.
+- `shot.audio.roll` is declared a float in the OpenAPI spec but is really
+  an alphanumeric sound-roll ID. The deserializer shim added in 1.4.0 keeps
+  it from taking down a request, but the spec is where it belongs — any
+  other tool built on that SDK hits the same thing.
+
 ## 1.4.2 - 2026-08-27
 
 ### Added

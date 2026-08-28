@@ -1,0 +1,111 @@
+SCRATCH Frame Grabber for macOS  (1.4.3, Apple Silicon)
+=======================================================
+
+INSTALL
+  Drag "SCRATCH Frame Grabber" onto the Applications folder shown here.
+
+FIRST LAUNCH
+  This app is not notarized by Apple. If you copied this disk image from
+  another machine (download, AirDrop, email), macOS will block it the
+  first time: right-click the app in Applications, choose "Open", and
+  confirm. Only needed once. A copy built locally opens with no warning.
+
+BEFORE YOU GRAB FRAMES
+  1. Open SCRATCH and load your project.
+  2. SCRATCH's REST API must be enabled, on port 8080 (the default).
+
+THREE WAYS TO RUN
+  "Grab open timeline"
+      Just the timeline currently open. Frames land straight in the
+      output folder you picked.
+
+  "Grab this group"
+      Every timeline in the group the open timeline belongs to -- for
+      when you have just finished a shooting day and the earlier days
+      are already captured. It writes to the same
+      <output folder>/<group>/ a whole-project run uses, so days grabbed
+      one at a time sit alongside each other. It builds that group's
+      gallery.html but leaves the project-wide one alone.
+      A group chosen this way is never skipped for its name.
+
+      Re-grabbing a day you have already captured refreshes those
+      stills in place rather than adding a second copy of each. See
+      "number files in shot order" below if you do this often.
+
+  "Grab whole project"
+      Walks every group and every timeline in the open project and
+      builds:
+          <output folder>/<group>/frames...
+          <output folder>/<group>/gallery.html   (that group)
+          <output folder>/gallery.html             (the whole project)
+
+      Groups whose names don't match the pattern the other groups follow
+      are skipped -- e.g. a "Stills" group sitting alongside
+      DIKMH_08_22_2026_DAY_04 and friends. If there are fewer than three
+      groups, or no clear majority pattern, nothing is skipped.
+
+SKIP CLIPS SHORTER THAN ### FRAMES
+  Drops false starts, camera tests and single-frame stills. The count is
+  editable -- 200 frames is about 8 seconds at 23.976fps. It measures the
+  clip's length in the timeline, not the length of the source file.
+
+  This runs BEFORE the last-take filter, so a scene whose final take is a
+  false start falls back to the last take that is long enough, instead of
+  dropping out of the stills altogether.
+
+LAST TAKE OF EACH SCENE
+  Tick this to keep only the highest-numbered take per scene.
+  Scene letters count as their own scene: 46 and 46A each keep a take.
+  Any shot with no scene or no take is always kept.
+
+SKIP CLIPS MISSING CERTAIN FLAGS
+  Off by default, with the field pre-filled "#scene #take" -- tick it and
+  unslated clips are skipped. The field takes any of the naming flags, so
+  you can require #reelid instead, or #scene on its own, or #file to drop
+  shots whose media went offline. A clip is skipped when ANY listed flag
+  comes back empty.
+
+  Unrecognised flag names are reported and ignored, and if nothing in the
+  field is recognised the run skips nothing on that basis rather than
+  dropping every clip.
+
+  Note that #tc, #frame and #date always produce a value, so listing them
+  has no effect.
+
+  The second checkbox keeps those clips instead of dropping them: they go
+  to an "unslated" subfolder inside the group folder, with their own
+  gallery.html, and are left out of the main contact sheet. Useful because
+  "unslated" is not always "unwanted" -- pickups, inserts, plates and
+  B-roll often run long without a slate, exactly like a blooper does.
+  Files there are named after the clip when the naming pattern has nothing
+  to work with.
+
+NUMBER FILES IN SHOT ORDER
+  On by default: files get 01_, 02_, 03_ ... in front, running on across
+  a group's timelines.
+
+  Turn it OFF if you re-grab days regularly. With the number, a shot that
+  changes position -- because a take was added, or you moved the length
+  threshold -- is written again under its new number and the old file is
+  left behind. Without it, each shot always maps to the same filename, so
+  a re-grab overwrites cleanly. (Measured on one day: re-grabbing after a
+  threshold change left 60 files on disk with numbering on, 32 without.)
+
+NAMING
+  The naming pattern takes SCRATCH-style #flags, e.g.
+     #name_#tc   ->  A007C001_260822_ROO1_11390810
+  Timecode renders as unbroken digits, not 11_39_08_10.
+
+  A \ or / in the pattern is a folder boundary, as in SCRATCH's own
+  naming module -- \#construct\#name.#ext writes each timeline's frames
+  into its own subfolder. Note this stacks with the group folders a
+  group/project run already makes.
+
+  A pattern may end in a literal ".#ext"; the extension is not appended
+  twice.
+
+WHERE SETTINGS LIVE
+  ~/Library/Application Support/SCRATCH Frame Grabber/
+
+REQUIREMENTS
+  macOS 11 or later, Apple Silicon. Python is bundled -- nothing to install.
