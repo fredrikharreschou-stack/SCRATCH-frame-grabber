@@ -1,0 +1,1297 @@
+--- /Users/Wyatt/Downloads/scratch_frame_grabber.py	2026-08-25 17:53:55
++++ scratch_frame_grabber.py	2026-08-28 02:42:07
+@@ -28,9 +28,12 @@
+ 
+ import os
+ import io
++import sys
+ import re
+ import json
+ import html
++import shutil
++import collections
+ import queue
+ import datetime
+ import threading
+@@ -42,6 +45,44 @@
+ import assimilate_client
+ from assimilate_client.rest import ApiException
+ 
++
++def _install_lenient_primitive_deserializer():
++    """Stop one odd metadata value from failing an entire request.
++
++    Assimilate's generated REST client coerces each field to the type its
++    OpenAPI spec declares. Some declared types don't match what SCRATCH
++    actually sends -- the clearest case is a shot's audio "roll", declared
++    as a float but genuinely an alphanumeric sound-roll ID (date-style
++    rolls like "26Y08M22" are common from location sound recorders).
++
++    float("26Y08M22") raises ValueError, and the client only guards against
++    TypeError and UnicodeEncodeError, so the exception escapes and takes
++    down the whole get-slots call -- the timeline simply appears
++    unreachable. Keep the raw value instead when conversion fails; every
++    field this app reads is turned into text anyway.
++    """
++    try:
++        from assimilate_client.api_client import ApiClient
++    except Exception:
++        return False
++    attr = "_ApiClient__deserialize_primitive"   # name-mangled private method
++    original = getattr(ApiClient, attr, None)
++    if original is None or getattr(original, "_fg_lenient", False):
++        return False
++
++    def lenient(self, data, klass):
++        try:
++            return original(self, data, klass)
++        except ValueError:
++            return data
++
++    lenient._fg_lenient = True
++    setattr(ApiClient, attr, lenient)
++    return True
++
++
++_install_lenient_primitive_deserializer()
++
+ try:
+     from PIL import Image
+     PIL_AVAILABLE = True
+@@ -55,13 +96,21 @@
+ 
+ 
+ def load_logo_image(url, target_height=32):
+-    """Fetch the Assimilate logo and return a CTkImage sized to target_height,
+-    or None if it can't be fetched (offline, URL moved, Pillow missing, etc)."""
++    """Return the Assimilate logo as a CTkImage sized to target_height.
++
++    Prefers a copy bundled with the app so the header still renders on an
++    offline machine; falls back to fetching it from the web. Returns None if
++    neither works (Pillow missing, offline with no bundled copy, URL moved).
++    """
+     if not PIL_AVAILABLE:
+         return None
+     try:
+-        with urllib.request.urlopen(url, timeout=5) as resp:
+-            data = resp.read()
++        local = resource_path("assimilate_logo.png")
++        if os.path.exists(local):
++            data = open(local, "rb").read()
++        else:
++            with urllib.request.urlopen(url, timeout=5) as resp:
++                data = resp.read()
+         img = Image.open(io.BytesIO(data))
+         img.load()
+         width, height = img.size
+@@ -72,10 +121,65 @@
+     except Exception:
+         return None
+ 
+-SETTINGS_FILE = os.path.join(
+-    os.path.dirname(os.path.abspath(__file__)), "scratch_frame_grabber_settings.json"
+-)
++APP_NAME = "SCRATCH Frame Grabber"
+ 
++
++def _is_frozen():
++    """True when running from a PyInstaller bundle (.app / .exe)."""
++    return getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
++
++
++def resource_path(*parts):
++    """Locate a read-only bundled resource, frozen or running from source."""
++    if _is_frozen():
++        base = sys._MEIPASS
++    else:
++        base = os.path.dirname(os.path.abspath(__file__))
++    return os.path.join(base, *parts)
++
++
++def settings_dir():
++    """A writable, per-user location for settings.
++
++    Running from source this stays next to the script (unchanged behavior).
++    Once bundled, the app directory is read-only -- and on macOS lives inside
++    the .app -- so we use the platform's standard per-user config location.
++    """
++    if not _is_frozen():
++        return os.path.dirname(os.path.abspath(__file__))
++    if sys.platform == "darwin":
++        return os.path.join(
++            os.path.expanduser("~/Library/Application Support"), APP_NAME
++        )
++    if os.name == "nt":
++        base = os.environ.get("APPDATA") or os.path.expanduser("~")
++        return os.path.join(base, APP_NAME)
++    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
++    return os.path.join(base, "scratch-frame-grabber")
++
++
++SETTINGS_DIR = settings_dir()
++SETTINGS_FILE = os.path.join(SETTINGS_DIR, "scratch_frame_grabber_settings.json")
++
++
++def _migrate_legacy_settings():
++    """Carry settings over from an older side-by-side install, once."""
++    if os.path.exists(SETTINGS_FILE):
++        return
++    legacy = os.path.join(
++        os.path.dirname(os.path.abspath(__file__)),
++        "scratch_frame_grabber_settings.json",
++    )
++    if legacy != SETTINGS_FILE and os.path.exists(legacy):
++        try:
++            os.makedirs(SETTINGS_DIR, exist_ok=True)
++            shutil.copy2(legacy, SETTINGS_FILE)
++        except Exception:
++            pass
++
++
++_migrate_legacy_settings()
++
+ DEFAULT_SETTINGS = {
+     "host": "http://localhost:8080/APIV2",
+     "access_key": "",
+@@ -87,9 +191,21 @@
+     "custom_width": 1920,
+     "naming_pattern": "#name",
+     "make_gallery": True,
++    "last_take_only": False,
++    "skip_short": True,
++    "min_length": 200,
++    "number_prefix": True,
++    "skip_missing_flags": False,
++    "require_flags": "#scene #take",
++    "unslated_subfolder": False,
+ }
+ 
++# Where clips that fail the required-flag check land, when the option to keep
++# them is on. Kept as a constant so the folder name, the gallery title and the
++# log messages can't disagree.
++UNSLATED_DIRNAME = "unslated"
+ 
++
+ def load_settings():
+     if os.path.exists(SETTINGS_FILE):
+         try:
+@@ -105,6 +221,7 @@
+ 
+ def save_settings(settings):
+     try:
++        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+         with open(SETTINGS_FILE, "w") as f:
+             json.dump(settings, f, indent=2)
+     except Exception:
+@@ -193,8 +310,15 @@
+ 
+ 
+ def _h_file(ctx, params):
++    # os.path.splitext only strips the LAST extension. Some sources come
++    # back from SCRATCH with a compound extension on the filename itself
++    # (e.g. a JPEG proxy named "...p1F9V.jpg.jpg") -- splitext would leave
++    # one ".jpg" behind, which then collides with a literal ".#ext" at the
++    # end of the naming pattern. Strip everything from the first dot
++    # instead, since a source filename's "name" portion essentially never
++    # contains a literal dot of its own.
+     f = ctx["shot"].file or ""
+-    base = os.path.splitext(os.path.basename(f))[0] if f else ""
++    base = os.path.basename(f).split(".", 1)[0] if f else ""
+     return _slice_chars(base, params)
+ 
+ 
+@@ -204,14 +328,28 @@
+     return str(ctx.get("output_ext") or "")
+ 
+ 
++TC_SEPARATORS = ":;."
++
++
++def _strip_tc_separators(text):
++    """Render a timecode as unbroken digits.
++
++    Timecode arrives as 11:39:08:10 (or 11:39:08;10 when drop-frame). A
++    colon can't appear in a filename, so the sanitizer would turn each one
++    into an underscore -- 11_39_08_10. Dropping the separators here gives
++    11390810 instead, which stays compact and sorts correctly.
++    """
++    return "".join(ch for ch in str(text) if ch not in TC_SEPARATORS)
++
++
+ def _h_tc(ctx, params):
+     shot = ctx["shot"]
+     tc = str(shot.timecode or getattr(shot, "frame_tc", None) or "")
+-    return _pad_left(tc, params)
++    return _pad_left(_strip_tc_separators(tc), params)
+ 
+ 
+ def _h_rtc(ctx, params):
+-    return _slice_chars(str(ctx.get("record_tc") or ""), params)
++    return _slice_chars(_strip_tc_separators(ctx.get("record_tc") or ""), params)
+ 
+ 
+ def _h_frame(ctx, params):
+@@ -487,18 +625,159 @@
+     with open(gallery_path, "w", encoding="utf-8") as f:
+         f.write(page)
+     return gallery_path
++
++
++def parse_flag_list(text):
++    """Pull flag names out of a free-text field.
++
++    Accepts the shapes people actually type -- "#scene #take", "scene, take",
++    "#scene,#take". Returns (known, unknown) as lowercase names, order kept
++    and duplicates dropped, so an unrecognised entry can be reported rather
++    than silently changing what gets skipped.
++    """
++    found = re.findall(r"#?([A-Za-z][A-Za-z0-9]*)", text or "")
++    known, unknown, seen = [], [], set()
++    for name in found:
++        name = name.lower()
++        if name in seen:
++            continue
++        seen.add(name)
++        (known if name in AVAILABLE_FLAGS else unknown).append(name)
++    return known, unknown
+ 
+ 
++PATH_SEPARATORS_RE = re.compile(r"[\\/]+")
++
++
++def render_pattern_segments(rendered):
++    """Split a rendered naming pattern into path segments.
++
++    SCRATCH's own naming/output module treats "\\" (and "/") in a naming
++    pattern as a folder boundary -- e.g. "\\#group\\#construct\\#name"
++    writes into a <group>/<construct>/ subfolder tree instead of one flat
++    folder. Frame Grabber's naming pattern now honors the same
++    convention. Each segment between separators is sanitized on its own
++    -- so a stray character in one folder's name can't leak into the
++    next -- and a leading/doubled separator (patterns SCRATCH itself
++    writes with a leading "\\") just means "nothing there", not an
++    empty-named folder.
++
++    Returns a non-empty list of sanitized segments; the caller treats the
++    last one as the filename and the rest as folders to create.
++    """
++    raw_segments = [s for s in PATH_SEPARATORS_RE.split(rendered) if s.strip(" ._")]
++    if not raw_segments:
++        return ["shot"]
++    return [sanitize_full_filename(s) for s in raw_segments]
++
++
++def unique_path(path, taken):
++    """Return a path no other frame in THIS run has claimed.
++
++    Several timelines write into one group folder, so a naming pattern that
++    doesn't distinguish them (a bare #scene_#take, say) could produce the
++    same filename twice in one run; losing a frame silently is worse than a
++    slightly ugly name, so the second one gets " 2" appended.
++
++    Files left by an EARLIER run are deliberately not counted as taken --
++    re-grabbing a day you've already captured should refresh those stills,
++    not accumulate a second copy of every one of them.
++    """
++    if path not in taken:
++        return path
++    stem, ext = os.path.splitext(path)
++    n = 2
++    while f"{stem} {n}{ext}" in taken:
++        n += 1
++    return f"{stem} {n}{ext}"
++
++
++def take_sort_key(take):
++    """Order takes so "last" means the highest take, not the last string.
++
++    Takes are normally zero-padded numbers ("01".."12") but can carry a
++    letter ("2A"). Sorting on the leading number first keeps 10 after 9
++    (plain string sort would not) and puts "2A" just after "2".
++    """
++    s = str(take or "").strip()
++    m = re.match(r"(\d+)(.*)$", s)
++    if m:
++        return (0, int(m.group(1)), m.group(2).upper())
++    return (1, 0, s.upper())
++
++
++def select_last_takes(entries):
++    """Keep only the highest-numbered take of each scene.
++
++    entries is a list of (slot, shot). Scene letters are significant --
++    46 and 46A are different setups, so each keeps its own last take.
++    Any shot missing a scene or a take can't be ranked, so it is always
++    kept. Results come back in timeline order.
++    """
++    best = {}
++    passthrough = []
++    for idx, (slot, shot) in enumerate(entries):
++        scene = str(getattr(shot, "scene", None) or "").strip()
++        take = str(getattr(shot, "take", None) or "").strip()
++        if not scene or not take:
++            passthrough.append((idx, slot, shot))
++            continue
++        key = scene.upper()
++        rank = (take_sort_key(take), idx)
++        if key not in best or rank > best[key][0]:
++            best[key] = (rank, idx, slot, shot)
++    kept = [(idx, slot, shot) for (_r, idx, slot, shot) in best.values()]
++    kept.extend(passthrough)
++    kept.sort(key=lambda t: t[0])
++    return [(slot, shot) for _idx, slot, shot in kept]
++
++
++def name_shape(name):
++    """Collapse a name to its shape: runs of letters become A, runs of
++    digits become #, separators stay put.
++
++        DIKMH_08_22_2026_DAY_04  ->  A_#_#_#_A_#
++        Stills                   ->  A
++    """
++    out = []
++    for ch in str(name or ""):
++        tok = "#" if ch.isdigit() else ("A" if ch.isalpha() else ch)
++        if out and out[-1] == tok and tok in ("#", "A"):
++            continue
++        out.append(tok)
++    return "".join(out)
++
++
++def groups_matching_convention(names):
++    """Split group names into (keep, dropped) by majority name shape.
++
++    A project whose groups are shooting days -- DIKMH_08_22_2026_DAY_04 and
++    friends -- plus one stray "Stills" group drops the odd one out.
++
++    Fails open on purpose: with fewer than three groups, or no strict
++    majority shape, everything is kept. Silently skipping real work is a
++    worse outcome than grabbing a few frames you didn't want.
++    """
++    names = list(names)
++    if len(names) < 3:
++        return names, []
++    shapes = [name_shape(n) for n in names]
++    shape, hits = collections.Counter(shapes).most_common(1)[0]
++    if hits * 2 <= len(names):
++        return names, []
++    keep = [n for n, s in zip(names, shapes) if s == shape]
++    dropped = [n for n, s in zip(names, shapes) if s != shape]
++    return keep, dropped
++
++
+ class FrameGrabberApp(ctk.CTk):
+     def __init__(self):
+         super().__init__()
+         self.title("SCRATCH Frame Grabber")
+-        self.geometry("660x780")
++        self.geometry("660x1000")
+         self.minsize(600, 660)
+ 
+-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+-        if os.path.exists(icon_path):
+-            self._apply_icon(icon_path)
++        self._setup_window_icon()
+ 
+         self.settings = load_settings()
+         self.log_queue = queue.Queue()
+@@ -509,7 +788,28 @@
+         self._build_ui()
+         self.after(100, self._poll_log_queue)
+ 
+-    def _apply_icon(self, icon_path):
++    def _setup_window_icon(self):
++        """Apply the window icon using whatever the current platform accepts.
++
++        macOS takes the icon from the .app bundle's Info.plist, and Tk's
++        iconbitmap doesn't understand .icns, so there is nothing to do when
++        bundled. Windows uses .ico via iconbitmap; Linux uses a PNG via
++        iconphoto.
++        """
++        if sys.platform == "darwin":
++            if not _is_frozen():
++                self._apply_png_icon(resource_path("icon_512.png"))
++            return
++
++        if os.name == "nt":
++            ico = resource_path("icon.ico")
++            if os.path.exists(ico):
++                self._apply_ico_icon(ico)
++            return
++
++        self._apply_png_icon(resource_path("icon_512.png"))
++
++    def _apply_ico_icon(self, icon_path):
+         # customtkinter resets the window icon back to Tk's default blue
+         # feather a moment after startup, so setting it once in __init__
+         # gets silently overridden. Re-apply it a couple of times shortly
+@@ -518,12 +818,27 @@
+             try:
+                 self.iconbitmap(icon_path)
+             except Exception:
+-                pass  # e.g. running on macOS/Linux where .ico isn't supported -- harmless
++                pass
+ 
+         set_icon()
+         self.after(150, set_icon)
+         self.after(400, set_icon)
+ 
++    def _apply_png_icon(self, png_path):
++        if not os.path.exists(png_path):
++            return
++
++        def set_icon():
++            try:
++                import tkinter
++                self._icon_photo = tkinter.PhotoImage(file=png_path)
++                self.iconphoto(True, self._icon_photo)
++            except Exception:
++                pass
++
++        set_icon()
++        self.after(150, set_icon)
++
+     def _build_ui(self):
+         self.grid_columnconfigure(0, weight=1)
+ 
+@@ -595,8 +910,15 @@
+         ctk.CTkLabel(card, text="Frame to grab").grid(row=4, column=0, sticky="w", padx=(18, 8), pady=8)
+         self.frame_btn = ctk.CTkSegmentedButton(card, values=["First frame", "Middle frame"])
+         self.frame_btn.set("First frame" if self.settings["frame_choice"] == "first" else "Middle frame")
+-        self.frame_btn.grid(row=4, column=1, columnspan=2, sticky="w", pady=8)
++        self.frame_btn.grid(row=4, column=1, sticky="w", pady=8)
+ 
++        self.last_take_var = BooleanVar(value=self.settings.get("last_take_only", False))
++        ctk.CTkCheckBox(
++            card,
++            text="Last take of each scene only",
++            variable=self.last_take_var,
++        ).grid(row=4, column=2, sticky="w", padx=(12, 18), pady=8)
++
+         # File naming pattern -- uses SCRATCH's own #flag syntax
+         ctk.CTkLabel(card, text="File naming pattern").grid(
+             row=5, column=0, sticky="w", padx=(18, 8), pady=8
+@@ -620,14 +942,58 @@
+         ctk.CTkLabel(
+             card,
+             text=(
+-                "Uses SCRATCH's own #flag syntax, e.g. #reelid_#scene_#take_#name. A running\n"
+-                "number is always added in front so files stay unique and in shot order. Flags\n"
+-                "SCRATCH offers that this API can't supply yet are simply left blank."
++                "Uses SCRATCH's own #flag syntax, e.g. #reelid_#scene_#take_#name. Flags\n"
++                "SCRATCH offers that this API can't supply yet are simply left blank. A \\ or /\n"
++                "in the pattern creates subfolders, e.g. \\#group\\#construct\\#name.#ext."
+             ),
+             justify="left",
+             font=ctk.CTkFont(size=11),
+             text_color=("gray40", "gray65"),
+         ).grid(row=6, column=0, columnspan=3, sticky="w", padx=(18, 18), pady=(0, 8))
++
++        # Running number in front of each filename
++        self.number_prefix_var = BooleanVar(value=self.settings.get("number_prefix", True))
++        ctk.CTkCheckBox(
++            card,
++            text="Number files in shot order (01_, 02_ ...)",
++            variable=self.number_prefix_var,
++        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=(18, 18), pady=(0, 8))
++
++        # Skip very short clips -- false starts, camera tests, single-frame stills
++        short_row = ctk.CTkFrame(card, fg_color="transparent")
++        short_row.grid(row=8, column=0, columnspan=3, sticky="w", padx=(18, 18), pady=(0, 8))
++        self.skip_short_var = BooleanVar(value=self.settings.get("skip_short", True))
++        ctk.CTkCheckBox(
++            short_row, text="Skip clips shorter than", variable=self.skip_short_var
++        ).pack(side="left")
++        self.min_length_var = StringVar(value=str(self.settings.get("min_length", 200)))
++        ctk.CTkEntry(short_row, textvariable=self.min_length_var, width=64).pack(
++            side="left", padx=(8, 8)
++        )
++        ctk.CTkLabel(short_row, text="frames").pack(side="left")
++
++        # Require certain naming flags to carry data
++        flags_row = ctk.CTkFrame(card, fg_color="transparent")
++        flags_row.grid(row=9, column=0, columnspan=3, sticky="w", padx=(18, 18), pady=(0, 8))
++        self.require_flags_on_var = BooleanVar(value=self.settings.get("skip_missing_flags", False))
++        ctk.CTkCheckBox(
++            flags_row,
++            text="Skip clips missing any of these flags:",
++            variable=self.require_flags_on_var,
++        ).pack(side="left")
++        self.require_flags_var = StringVar(
++            value=self.settings.get("require_flags", "#scene #take")
++        )
++        ctk.CTkEntry(flags_row, textvariable=self.require_flags_var, width=190).pack(
++            side="left", padx=(8, 0)
++        )
++
++        self.unslated_var = BooleanVar(value=self.settings.get("unslated_subfolder", False))
++        ctk.CTkCheckBox(
++            card,
++            text=f"...and keep them in an '{UNSLATED_DIRNAME}' subfolder instead of skipping",
++            variable=self.unslated_var,
++        ).grid(row=10, column=0, columnspan=3, sticky="w", padx=(40, 18), pady=(0, 8))
+ 
+         # HTML gallery of the exported frames
+         self.gallery_var = BooleanVar(value=self.settings.get("make_gallery", True))
+@@ -635,7 +1001,7 @@
+             card,
+             text="Also build an HTML gallery page of the exported frames",
+             variable=self.gallery_var,
+-        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=(18, 18), pady=(0, 18))
++        ).grid(row=11, column=0, columnspan=3, sticky="w", padx=(18, 18), pady=(0, 18))
+ 
+         # Advanced toggle
+         self.adv_toggle = ctk.CTkButton(
+@@ -673,13 +1039,41 @@
+         run_row = ctk.CTkFrame(self, fg_color="transparent")
+         run_row.grid(row=5, column=0, sticky="ew", padx=24, pady=(16, 8))
+ 
++        # Three grab buttons won't fit on one line beside the cancel button
++        # and status text, so stack them: actions above, state below.
++        buttons_row = ctk.CTkFrame(run_row, fg_color="transparent")
++        buttons_row.pack(side="top", anchor="w")
++
++        status_row = ctk.CTkFrame(run_row, fg_color="transparent")
++        status_row.pack(side="top", anchor="w", pady=(10, 0))
++
+         self.run_btn = ctk.CTkButton(
+-            run_row, text="Grab frames from open timeline", height=38, command=self._on_run
++            buttons_row, text="Grab open timeline", height=38, command=self._on_run
+         )
+         self.run_btn.pack(side="left")
+ 
++        self.group_btn = ctk.CTkButton(
++            buttons_row,
++            text="Grab this group",
++            height=38,
++            fg_color="transparent",
++            border_width=1,
++            command=lambda: self._on_run("group"),
++        )
++        self.group_btn.pack(side="left", padx=(10, 0))
++
++        self.project_btn = ctk.CTkButton(
++            buttons_row,
++            text="Grab whole project",
++            height=38,
++            fg_color="transparent",
++            border_width=1,
++            command=lambda: self._on_run("project"),
++        )
++        self.project_btn.pack(side="left", padx=(10, 0))
++
+         self.cancel_btn = ctk.CTkButton(
+-            run_row,
++            status_row,
+             text="Cancel export",
+             height=38,
+             width=130,
+@@ -692,7 +1086,7 @@
+         self.cancel_btn.pack(side="left", padx=(10, 0))
+ 
+         self.status_var = StringVar(value="Ready.")
+-        ctk.CTkLabel(run_row, textvariable=self.status_var, text_color=("gray40", "gray65")).pack(
++        ctk.CTkLabel(status_row, textvariable=self.status_var, text_color=("gray40", "gray65")).pack(
+             side="left", padx=16
+         )
+ 
+@@ -748,7 +1142,7 @@
+             self.log_box.configure(state="disabled")
+         self.after(100, self._poll_log_queue)
+ 
+-    def _on_run(self):
++    def _on_run(self, mode="timeline"):
+         if self.worker and self.worker.is_alive():
+             return
+ 
+@@ -773,6 +1167,19 @@
+                 self._log(f"'{self.custom_width_var.get()}' isn't a valid width. Enter a whole number of pixels, e.g. 1920.")
+                 return
+ 
++        min_length = self.settings.get("min_length", 200)
++        if self.skip_short_var.get():
++            try:
++                min_length = int(self.min_length_var.get().strip())
++                if min_length < 0:
++                    raise ValueError
++            except ValueError:
++                self._log(
++                    f"'{self.min_length_var.get()}' isn't a valid frame count. "
++                    "Enter a whole number, e.g. 200."
++                )
++                return
++
+         settings = {
+             "host": self.host_var.get().strip(),
+             "access_key": self.key_var.get().strip(),
+@@ -783,6 +1190,13 @@
+             "frame_choice": "first" if self.frame_btn.get() == "First frame" else "middle",
+             "naming_pattern": self.naming_pattern_var.get().strip() or DEFAULT_SETTINGS["naming_pattern"],
+             "make_gallery": bool(self.gallery_var.get()),
++            "last_take_only": bool(self.last_take_var.get()),
++            "skip_short": bool(self.skip_short_var.get()),
++            "min_length": min_length,
++            "number_prefix": bool(self.number_prefix_var.get()),
++            "skip_missing_flags": bool(self.require_flags_on_var.get()),
++            "require_flags": self.require_flags_var.get().strip(),
++            "unslated_subfolder": bool(self.unslated_var.get()),
+         }
+         save_settings(settings)
+ 
+@@ -792,10 +1206,12 @@
+ 
+         self.cancel_event.clear()
+         self.run_btn.configure(state="disabled")
++        self.group_btn.configure(state="disabled")
++        self.project_btn.configure(state="disabled")
+         self.cancel_btn.configure(state="normal")
+         self.status_var.set("Working...")
+ 
+-        self.worker = threading.Thread(target=self._grab_frames, args=(settings,), daemon=True)
++        self.worker = threading.Thread(target=self._grab_frames, args=(settings, mode), daemon=True)
+         self.worker.start()
+ 
+     def _on_cancel(self):
+@@ -805,13 +1221,47 @@
+             self.status_var.set("Cancelling...")
+             self._log("Cancelling -- will stop after the frame currently in progress.")
+ 
+-    def _grab_frames(self, settings):
++    def _grab_frames(self, settings, mode="timeline"):
+         try:
+-            self._grab_frames_inner(settings)
++            if mode == "project":
++                self._grab_project_inner(settings)
++            elif mode == "group":
++                self._grab_group_inner(settings)
++            else:
++                self._grab_frames_inner(settings)
+         finally:
+-            self.after(0, lambda: self.run_btn.configure(state="normal"))
+-            self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
++            self.after(0, self._set_idle)
+ 
++    def _set_idle(self):
++        self.run_btn.configure(state="normal")
++        self.group_btn.configure(state="normal")
++        self.project_btn.configure(state="normal")
++        self.cancel_btn.configure(state="disabled")
++
++    def _make_client(self, settings):
++        configuration = assimilate_client.Configuration()
++        configuration.host = settings["host"]
++        if settings["access_key"]:
++            configuration.api_key["Authorization"] = settings["access_key"]
++        return assimilate_client.ApiClient(configuration)
++
++    def _report_api_failure(self, e, settings, what):
++        """One place for the three ways talking to SCRATCH can go wrong."""
++        if isinstance(e, ApiException):
++            self._log(f"Couldn't reach {what}.")
++            self._log("  - Is SCRATCH running with a project open?")
++            self._log("  - Is the REST API still enabled in System Settings?")
++            self._log(f"  - Details: {e}")
++        elif isinstance(e, (ValueError, TypeError)):
++            self._log("SCRATCH answered, but part of the data couldn't be read.")
++            self._log("  - A metadata field holds a value the REST API spec doesn't expect.")
++            self._log(f"  - Details: {type(e).__name__}: {e}")
++        else:
++            self._log(f"Couldn't connect to SCRATCH at {settings['host']}")
++            self._log("  - Is SCRATCH running with the REST API turned on?")
++            self._log(f"  - Details: {e}")
++        self.after(0, lambda: self.status_var.set("Failed - see log"))
++
+     def _resize_to_width(self, path, target_width, ext):
+         with Image.open(path) as img:
+             width, height = img.size
+@@ -830,48 +1280,60 @@
+         come out blank if we can't get them."""
+         project_name = group_name = construct_name = record_tc = ""
+         try:
+-            constructs = proj_api.get_constructs_current(level="ALL")
+-            clist = getattr(constructs, "constructs", None) or []
++            current = proj_api.get_constructs_current(level="ALL")
++            # This endpoint returns the open construct itself. The original
++            # code looked for a .constructs list hanging off it, found none,
++            # and left #construct and #rtc blank on every run. Use the object
++            # directly, but keep the list shape as a fallback in case another
++            # SCRATCH build answers that way.
++            target = current
++            clist = getattr(current, "constructs", None) or []
+             if clist:
+-                c = clist[0]
+-                construct_name = getattr(c, "name", "") or ""
+-                record_tc = getattr(c, "record_tc", "") or ""
+-        except Exception:
+-            pass
+-        try:
+-            proj = proj_api.get_project_current()
+-            project_name = getattr(proj, "name", "") or ""
++                target = clist[0]
++            construct_name = getattr(target, "name", "") or ""
++            record_tc = getattr(target, "record_tc", "") or ""
+         except Exception:
+             pass
++        project_name = self._lookup_name(proj_api, "get_projects_current", "get_project_current")
++        group_name = self._lookup_name(proj_api, "get_group_current", "get_groups_current")
+         return project_name, group_name, construct_name, record_tc
+ 
++    def _lookup_name(self, proj_api, *candidates):
++        """Read a "current object" name, tolerating the SDK's inconsistent
++        singular/plural method names.
++
++        The endpoint for the open project is exposed as
++        get_projects_current (plural); the original script called
++        get_project_current, which doesn't exist -- the AttributeError was
++        swallowed by a bare except, so #project always rendered blank.
++        Try each spelling and take the first that answers.
++        """
++        for attr in candidates:
++            fn = getattr(proj_api, attr, None)
++            if fn is None:
++                continue
++            try:
++                return getattr(fn(), "name", "") or ""
++            except Exception:
++                continue
++        return ""
++
+     def _grab_frames_inner(self, settings):
++        """Grab from the timeline currently open in SCRATCH."""
++        self._short_skipped = 0
++        self._missing_flag_skipped = 0
++        self._used_paths = set()
+         output_dir = os.path.expanduser(settings["output_dir"])
+         os.makedirs(output_dir, exist_ok=True)
+ 
+-        configuration = assimilate_client.Configuration()
+-        configuration.host = settings["host"]
+-        if settings["access_key"]:
+-            configuration.api_key["Authorization"] = settings["access_key"]
+-
+-        client = assimilate_client.ApiClient(configuration)
++        client = self._make_client(settings)
+         app_api = assimilate_client.ApplicationApi(client)
+         proj_api = assimilate_client.ProjectsApi(client)
+ 
+         try:
+             slots_data = proj_api.get_construct_current_slots(level="ALL")
+-        except ApiException as e:
+-            self._log("Couldn't reach SCRATCH's open timeline.")
+-            self._log("  - Is SCRATCH running with a project and timeline open?")
+-            self._log("  - Is the REST API still enabled in System Settings?")
+-            self._log(f"  - Details: {e}")
+-            self.after(0, lambda: self.status_var.set("Failed - see log"))
+-            return
+         except Exception as e:
+-            self._log(f"Couldn't connect to SCRATCH at {settings['host']}")
+-            self._log("  - Is SCRATCH running with the REST API turned on?")
+-            self._log(f"  - Details: {e}")
+-            self.after(0, lambda: self.status_var.set("Failed - see log"))
++            self._report_api_failure(e, settings, "SCRATCH's open timeline")
+             return
+ 
+         slots = slots_data.slots or []
+@@ -882,94 +1344,452 @@
+ 
+         self._log(f"Found {len(slots)} slot(s) in the open timeline. Grabbing frames...")
+ 
++        naming_ctx = self._fetch_naming_context(proj_api)
++        flag_sets = (set(), set())
++        gallery_entries = []
++        unslated_entries = []
++        unslated_dir = (
++            os.path.join(output_dir, UNSLATED_DIRNAME)
++            if settings.get("unslated_subfolder") else None
++        )
++        result = self._export_construct(
++            app_api, slots, settings, naming_ctx, output_dir, "",
++            gallery_entries, flag_sets,
++            unslated_dir=unslated_dir, unslated_entries=unslated_entries,
++        )
++        self._build_unslated_gallery(settings, unslated_dir, unslated_entries, naming_ctx[2])
++        self._finish_run(settings, output_dir, gallery_entries, naming_ctx[2],
++                         flag_sets, result["saved"], result["failed"],
++                         result["skipped"], result["cancelled"])
++
++    def _grab_project_inner(self, settings, only_group=None):
++        """Walk every group and timeline in the open project.
++
++        Groups whose names don't match the convention the rest of the
++        project follows are skipped -- a "Stills" group sitting alongside
++        DIKMH_08_22_2026_DAY_04 and friends is not a shooting day, and its
++        timelines don't hold slated takes.
++
++        Frames land in one folder per group, with numbering running on
++        across the group's timelines so the prefixes stay unique.
++        """
++        self._short_skipped = 0
++        self._missing_flag_skipped = 0
++        self._used_paths = set()
++        output_dir = os.path.expanduser(settings["output_dir"])
++        os.makedirs(output_dir, exist_ok=True)
++
++        client = self._make_client(settings)
++        app_api = assimilate_client.ApplicationApi(client)
++        proj_api = assimilate_client.ProjectsApi(client)
++
++        try:
++            groups_data = proj_api.get_groups(level="ALL")
++        except Exception as e:
++            self._report_api_failure(e, settings, "the project's groups")
++            return
++
++        groups = groups_data.groups or []
++        if not groups:
++            self._log("No groups found in the open project.")
++            self.after(0, lambda: self.status_var.set("Nothing found"))
++            return
++
++        project_name = self._lookup_name(proj_api, "get_projects_current", "get_project_current")
++
++        if only_group is not None:
++            # An explicitly chosen group is never second-guessed -- if you
++            # opened a timeline inside it, you meant it, even if its name
++            # doesn't match the others.
++            if not any((g.name or "") == only_group for g in groups):
++                self._log(f"Couldn't find the group '{only_group}' in this project.")
++                self.after(0, lambda: self.status_var.set("Group not found"))
++                return
++            keep_set = {only_group}
++            self._log(f"Project '{project_name}' -- grabbing group '{only_group}'.")
++        else:
++            keep, dropped = groups_matching_convention([g.name or "" for g in groups])
++            keep_set = set(keep)
++            self._log(f"Project '{project_name}': {len(groups)} group(s).")
++            for name in dropped:
++                self._log(f"  Skipping group '{name}' -- its name doesn't match the pattern the others use.")
++            if not dropped and len(groups) >= 3:
++                self._log("  All group names follow one pattern; none skipped.")
++
++        flag_sets = (set(), set())
++        gallery_entries = []
++        saved = failed = skipped = 0
++        cancelled = False
++        groups_done = constructs_done = 0
++
++        for group in groups:
++            if cancelled:
++                break
++            gname = group.name or ""
++            if gname not in keep_set:
++                continue
++            constructs = getattr(group, "constructs", None) or []
++            if not constructs:
++                continue
++
++            groups_done += 1
++            group_dirname = safe_filename(gname)
++            group_dir = os.path.join(output_dir, group_dirname)
++            group_entries = []
++            group_index = 0
++            group_unslated_entries = []
++            group_unslated_index = 0
++            group_unslated_dir = (
++                os.path.join(group_dir, UNSLATED_DIRNAME)
++                if settings.get("unslated_subfolder") else None
++            )
++            self._log("")
++            self._log(f"Group: {gname}  ({len(constructs)} timeline(s))")
++
++            for construct in constructs:
++                if self.cancel_event.is_set():
++                    cancelled = True
++                    break
++                cname = construct.name or ""
++                slots = getattr(construct, "slots", None) or []
++                if not slots:
++                    self._log(f"  Timeline '{cname}': empty, skipped.")
++                    continue
++
++                constructs_done += 1
++                self._log(f"  Timeline: {cname}")
++                naming_ctx = (
++                    project_name, gname, cname,
++                    getattr(construct, "record_tc", "") or "",
++                )
++                # Every timeline in a group writes straight into the group
++                # folder -- one folder per shooting day, no per-timeline
++                # subfolders. Numbering runs on across the group so the NN_
++                # prefixes stay unique, and gallery filenames are bare names
++                # relative to that same folder.
++                result = self._export_construct(
++                    app_api, slots, settings, naming_ctx,
++                    group_dir, "", group_entries, flag_sets,
++                    index_offset=group_index,
++                    unslated_dir=group_unslated_dir,
++                    unslated_entries=group_unslated_entries,
++                    unslated_offset=group_unslated_index,
++                )
++                group_index = result["next_offset"]
++                group_unslated_index = result["next_unslated_offset"]
++                saved += result["saved"]
++                failed += result["failed"]
++                skipped += result["skipped"]
++                if result["cancelled"]:
++                    cancelled = True
++                    break
++
++            if settings.get("make_gallery") and group_entries:
++                try:
++                    title = f"{project_name} -- {gname}" if project_name else gname
++                    path = build_html_gallery(group_dir, group_entries, title)
++                    self._log(f"  Gallery for this group: {path}")
++                except Exception as e:
++                    self._log(f"  Note: couldn't build the gallery for '{gname}': {e}")
++
++            self._build_unslated_gallery(
++                settings, group_unslated_dir, group_unslated_entries,
++                f"{project_name} -- {gname}" if project_name else gname,
++            )
++
++            gallery_entries.extend(
++                {"filename": group_dirname + "/" + entry["filename"],
++                 "shot_name": entry["shot_name"]}
++                for entry in group_entries
++            )
++
++        self._log("")
++        self._log(f"Covered {groups_done} group(s), {constructs_done} timeline(s).")
++        # A single-group run must not rewrite the project-wide gallery -- that
++        # page belongs to a full run and would be replaced by one day's stills.
++        self._finish_run(settings, output_dir, gallery_entries, project_name,
++                         flag_sets, saved, failed, skipped, cancelled,
++                         write_gallery=(only_group is None))
++
++    def _grab_group_inner(self, settings):
++        """Grab every timeline in the group the open timeline belongs to.
++
++        Meant for the end of a shooting day when the earlier days are
++        already captured. It writes into the same <output>/<group>/ folder
++        a whole-project run would use, so a day grabbed on its own sits
++        alongside days grabbed earlier instead of duplicating them.
++        """
++        proj_api = assimilate_client.ProjectsApi(self._make_client(settings))
++        group_name = self._lookup_name(proj_api, "get_group_current", "get_groups_current")
++        if not group_name:
++            self._log("Couldn't tell which group is open in SCRATCH.")
++            self._log("  - Open a timeline inside the group you want, then try again.")
++            self.after(0, lambda: self.status_var.set("No group open"))
++            return
++        self._grab_project_inner(settings, only_group=group_name)
++
++    def _build_unslated_gallery(self, settings, unslated_dir, entries, title):
++        """Contact sheet for the diverted clips, inside their own folder."""
++        if not (settings.get("make_gallery") and unslated_dir and entries):
++            return
++        try:
++            label = f"{title} -- {UNSLATED_DIRNAME}" if title else UNSLATED_DIRNAME
++            path = build_html_gallery(unslated_dir, entries, label)
++            self._log(f"  Gallery for {UNSLATED_DIRNAME}: {path}")
++        except Exception as e:
++            self._log(f"  Note: couldn't build the {UNSLATED_DIRNAME} gallery: {e}")
++
++    def _render_pairs(self, app_api, pairs, settings, naming_ctx, out_dir,
++                      rel_prefix, gallery_entries, flag_sets, index_offset):
++        """Render one frame for each (slot, shot) into out_dir.
++
++        The main pass and the unslated pass both come through here, so the
++        two can't drift apart in naming, numbering or resize handling.
++        Returns (saved, failed, cancelled, next_offset).
++        """
++        project_name, group_name, construct_name, record_tc = naming_ctx
++        all_unknown, all_unsupported = flag_sets
+         ext = settings["file_format"].lower()
+         if ext not in ("jpg", "png", "tif"):
+             ext = "jpg"
+-
+         naming_pattern = settings.get("naming_pattern") or DEFAULT_SETTINGS["naming_pattern"]
+-        project_name, group_name, construct_name, record_tc = self._fetch_naming_context(proj_api)
+-        all_unknown_flags = set()
+-        all_known_unsupported_flags = set()
+ 
+-        saved, failed, skipped, cancelled = 0, 0, 0, False
+-        gallery_entries = []
+-        for i, slot in enumerate(slots, start=1):
++        if not pairs:
++            return 0, 0, False, index_offset
++
++        os.makedirs(out_dir, exist_ok=True)
++        use_proxy = settings["resolution_mode"] == "proxy"
++        saved = failed = consumed = 0
++        cancelled = False
++        total = len(pairs)
++
++        for i, (slot, shot) in enumerate(pairs, start=1):
+             if self.cancel_event.is_set():
+-                self._log(f"Cancelled after {i - 1}/{len(slots)} slot(s).")
++                self._log(f"    Cancelled after {i - 1}/{total}.")
+                 cancelled = True
+                 break
++            consumed = i
++            seq = index_offset + i
+ 
+-            slot_shots = slot.shots or []
+-            if not slot_shots:
+-                self._log(f"  [{i}/{len(slots)}] SKIP - slot '{slot.name}' has no shot in it")
+-                skipped += 1
+-                continue
+-
+-            shot = slot_shots[0]
+             frame = pick_snapshot_frame(shot, settings["frame_choice"])
+-
+             ctx = build_shot_context(
+                 shot, slot, frame, project_name, group_name, construct_name, record_tc, ext
+             )
+-            rendered, unknown_flags, known_unsupported_flags = render_naming_pattern(naming_pattern, ctx)
+-            all_unknown_flags |= unknown_flags
+-            all_known_unsupported_flags |= known_unsupported_flags
+-            name = sanitize_full_filename(rendered)
+-            out_path = os.path.join(output_dir, f"{i:02d}_{name}.{ext}")
+-
+-            # Custom width needs the biggest starting image to downscale from,
+-            # so we always pull full resolution in that mode.
+-            use_proxy = settings["resolution_mode"] == "proxy"
+-
+-            snapshot = assimilate_client.ImageSnapshot(
+-                uuid=shot.uuid,
+-                frame=frame,
+-                proxy=use_proxy,
+-                file=out_path,
++            rendered, unknown_flags, unsupported_flags = render_naming_pattern(naming_pattern, ctx)
++            all_unknown |= unknown_flags
++            all_unsupported |= unsupported_flags
++            # An unslated clip renders a pattern like #scene_#take as nothing
++            # but its literal separators -- "_" -- which the sanitizer then
++            # strips down to its own "shot" fallback, so every such file would
++            # collide on one name. Test for real characters rather than for an
++            # empty string, and fall back to the clip's own name. Done before
++            # the pattern is split into path segments, so the fallback name
++            # lands in the filename rather than inventing a folder.
++            if not any(ch.isalnum() for ch in rendered):
++                rendered = shot.name or "shot"
++            # A "\" or "/" in the pattern is a folder boundary, matching
++            # SCRATCH's own naming module, so #group\#construct\#name writes
++            # into a <group>/<construct>/ tree. Only the last segment is the
++            # filename; everything before it is folders under out_dir.
++            segments = render_pattern_segments(rendered)
++            stem = segments[-1]
++            folders = segments[:-1]
++            # Without the running number the filename is whatever the pattern
++            # produces, which stays stable from run to run -- so re-grabbing a
++            # day overwrites its stills instead of leaving renumbered orphans.
++            if settings.get("number_prefix", True):
++                stem = f"{seq:02d}_{stem}"
++            # The pattern may already end in a literal ".#ext" -- #ext is meant
++            # to be usable inside a pattern -- so only append the extension
++            # when the rendered name doesn't already carry it.
++            suffix = f".{ext}"
++            filename = stem if stem.lower().endswith(suffix.lower()) else stem + suffix
++            out_path = unique_path(
++                os.path.join(out_dir, *(folders + [filename])),
++                self._used_paths,
+             )
++            self._used_paths.add(out_path)
++            os.makedirs(os.path.dirname(out_path), exist_ok=True)
++            # Derive the gallery href from the path we actually wrote. Building
++            # it from the segments instead would go stale whenever unique_path
++            # had to rename the file, leaving a broken image link.
++            fname = os.path.relpath(out_path, out_dir).replace(os.sep, "/")
+ 
+             try:
+-                app_api.do_application_render_snapshot(snapshot)
++                app_api.do_application_render_snapshot(
++                    assimilate_client.ImageSnapshot(
++                        uuid=shot.uuid, frame=frame, proxy=use_proxy, file=out_path
++                    )
++                )
+             except ApiException as e:
+-                self._log(f"  [{i}/{len(slots)}] FAIL - {shot.name}: {e}")
++                self._log(f"    [{i}/{total}] FAIL - {shot.name}: {e}")
+                 failed += 1
+                 continue
+ 
++            note = ""
+             if settings["resolution_mode"] == "custom":
+                 try:
+                     self._resize_to_width(out_path, settings["custom_width"], ext)
+-                    self._log(
+-                        f"  [{i}/{len(slots)}] OK   - {shot.name} (frame {frame}, "
+-                        f"resized to {settings['custom_width']}px wide) -> {out_path}"
+-                    )
++                    note = f", resized to {settings['custom_width']}px wide"
+                 except Exception as e:
++                    note = f" [kept full size -- resize failed: {e}]"
++            self._log(f"    [{i}/{total}] OK   - {shot.name} (frame {frame}{note})")
++
++            gallery_entries.append({"filename": rel_prefix + fname, "shot_name": shot.name})
++            saved += 1
++
++        return saved, failed, cancelled, index_offset + consumed
++
++    def _export_construct(self, app_api, slots, settings, naming_ctx, out_dir,
++                          rel_prefix, gallery_entries, flag_sets, index_offset=0,
++                          unslated_dir=None, unslated_entries=None, unslated_offset=0):
++        """Grab frames for a single timeline, applying the export filters.
++
++        Shared by all three run modes so they can't drift apart. Returns a
++        dict rather than a tuple -- there are too many counters now for
++        positional results to stay readable.
++
++        index_offset continues the NN_ filename numbering from a previous
++        timeline, which keeps prefixes unique when several timelines share
++        one group folder. unslated_dir, when set, receives the clips that
++        fail the required-flag check instead of dropping them.
++        """
++        project_name, group_name, construct_name, record_tc = naming_ctx
++        ext = settings["file_format"].lower()
++        if ext not in ("jpg", "png", "tif"):
++            ext = "jpg"
++
++        pairs = [(slot, (slot.shots or [None])[0]) for slot in slots]
++        skipped = sum(1 for _slot, shot in pairs if shot is None)
++        pairs = [(slot, shot) for slot, shot in pairs if shot is not None]
++        diverted = []
++
++        # Length first, then last-take. Doing it the other way round would let
++        # a scene whose final take is a false start lose its frame entirely;
++        # this way it falls back to the last take that's actually long enough.
++        minimum = int(settings.get("min_length") or 0) if settings.get("skip_short") else 0
++        if minimum > 0:
++            before = len(pairs)
++            pairs = [
++                (slot, shot) for slot, shot in pairs
++                if not isinstance(getattr(shot, "length", None), int)
++                or shot.length >= minimum
++            ]
++            dropped = before - len(pairs)
++            if dropped:
++                self._short_skipped = getattr(self, "_short_skipped", 0) + dropped
++                self._log(f"    shorter than {minimum} frames: {dropped} clip(s) skipped")
++
++        # Clips whose required flags come back empty -- an unslated clip has no
++        # #scene or #take, media that went offline has no #file. Reuses the
++        # same flag handlers the naming pattern uses.
++        if settings.get("skip_missing_flags") and pairs:
++            required, unrecognised = parse_flag_list(settings.get("require_flags", ""))
++            if unrecognised:
++                self._log(
++                    "    note: ignoring unrecognised flag(s): "
++                    + ", ".join("#" + f for f in unrecognised)
++                )
++            if not required:
++                self._log(
++                    "    note: no recognised flags to require, so nothing was skipped "
++                    "on that basis."
++                )
++            else:
++                kept = []
++                for slot, shot in pairs:
++                    frame = pick_snapshot_frame(shot, settings["frame_choice"])
++                    ctx = build_shot_context(
++                        shot, slot, frame, project_name, group_name,
++                        construct_name, record_tc, ext,
++                    )
++                    if all(
++                        str(AVAILABLE_FLAGS[name](ctx, None) or "").strip()
++                        for name in required
++                    ):
++                        kept.append((slot, shot))
++                    else:
++                        diverted.append((slot, shot))
++                pairs = kept
++                if diverted:
++                    where = "moved to %s/" % UNSLATED_DIRNAME if unslated_dir else "skipped"
++                    self._missing_flag_skipped = getattr(self, "_missing_flag_skipped", 0) + len(diverted)
+                     self._log(
+-                        f"  [{i}/{len(slots)}] OK   - {shot.name} (frame {frame}) -> {out_path} "
+-                        f"[kept full size -- resize failed: {e}]"
++                        "    missing %s: %d clip(s) %s"
++                        % (" / ".join("#" + f for f in required), len(diverted), where)
+                     )
+-            else:
+-                self._log(f"  [{i}/{len(slots)}] OK   - {shot.name} (frame {frame}) -> {out_path}")
+ 
+-            gallery_entries.append({"filename": os.path.basename(out_path), "shot_name": shot.name})
+-            saved += 1
++        if settings.get("last_take_only"):
++            before = len(pairs)
++            pairs = select_last_takes(pairs)
++            if before != len(pairs):
++                self._log(f"    last take of each scene: {before} shot(s) -> {len(pairs)}")
+ 
+-        if settings.get("make_gallery") and gallery_entries:
++        saved, failed, cancelled, next_offset = self._render_pairs(
++            app_api, pairs, settings, naming_ctx, out_dir, rel_prefix,
++            gallery_entries, flag_sets, index_offset,
++        )
++
++        # The diverted clips go to their own folder with their own numbering
++        # and their own gallery, so the main contact sheet stays clean while
++        # nothing is silently thrown away.
++        unslated_saved = 0
++        next_unslated = unslated_offset
++        if diverted and unslated_dir is not None and unslated_entries is not None and not cancelled:
++            self._log(f"    {len(diverted)} clip(s) -> {UNSLATED_DIRNAME}/")
++            unslated_saved, u_failed, u_cancelled, next_unslated = self._render_pairs(
++                app_api, diverted, settings, naming_ctx, unslated_dir, "",
++                unslated_entries, flag_sets, unslated_offset,
++            )
++            failed += u_failed
++            cancelled = cancelled or u_cancelled
++
++        return {
++            "saved": saved,
++            "failed": failed,
++            "skipped": skipped,
++            "cancelled": cancelled,
++            "next_offset": next_offset,
++            "unslated_saved": unslated_saved,
++            "next_unslated_offset": next_unslated,
++        }
++
++    def _finish_run(self, settings, output_dir, gallery_entries, title,
++                    flag_sets, saved, failed, skipped, cancelled,
++                    write_gallery=True):
++        """Gallery, flag notes and the closing summary -- shared by all modes."""
++        all_unknown, all_unsupported = flag_sets
++
++        if write_gallery and settings.get("make_gallery") and gallery_entries:
+             try:
+-                gallery_path = build_html_gallery(output_dir, gallery_entries, construct_name)
++                gallery_path = build_html_gallery(output_dir, gallery_entries, title)
+                 self._log(f"Gallery: {gallery_path}")
+             except Exception as e:
+                 self._log(f"Note: couldn't build the HTML gallery page: {e}")
+ 
+         self._log("")
+-        if all_known_unsupported_flags:
+-            for f in sorted(all_known_unsupported_flags):
+-                self._log(f"Note: #{f} is a real SCRATCH flag, but not supported here yet ({KNOWN_UNSUPPORTED_FLAGS[f]}) -- left blank.")
+-        if all_unknown_flags:
+-            flag_list = ", ".join(f"#{f}" for f in sorted(all_unknown_flags))
++        for flag in sorted(all_unsupported):
+             self._log(
++                f"Note: #{flag} is a real SCRATCH flag, but not supported here yet "
++                f"({KNOWN_UNSUPPORTED_FLAGS[flag]}) -- left blank."
++            )
++        if all_unknown:
++            flag_list = ", ".join(f"#{f}" for f in sorted(all_unknown))
++            self._log(
+                 f"Note: naming pattern used flag(s) not recognized (check spelling, left blank): {flag_list}"
+             )
+         summary = f"{saved} saved, {failed} failed, {skipped} empty slot(s) skipped"
++        short_skipped = getattr(self, "_short_skipped", 0)
++        if short_skipped:
++            minimum = int(settings.get("min_length") or 0)
++            summary += f", {short_skipped} clip(s) under {minimum} frames skipped"
++        missing_flags = getattr(self, "_missing_flag_skipped", 0)
++        if missing_flags:
++            where = (
++                f"moved to {UNSLATED_DIRNAME}/"
++                if settings.get("unslated_subfolder") else "skipped"
++            )
++            summary += f", {missing_flags} clip(s) missing required flags {where}"
+         self._log(("Cancelled. " if cancelled else "Done. ") + summary + ".")
+         self._log(f"Folder: {output_dir}")
+         status = f"Cancelled - {saved} saved" if cancelled else f"Done - {saved} saved"

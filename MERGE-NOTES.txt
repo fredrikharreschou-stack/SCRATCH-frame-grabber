@@ -1,0 +1,50 @@
+Notes for the pull request
+==========================
+
+scratch_frame_grabber.py here is 1.4.3: your 1.4.2 with three options added
+and three bugs fixed. Nothing from 1.4.1 or 1.4.2 was dropped or reworked --
+both of your changes are in as written, aside from the href fix described
+below.
+
+Reviewing it
+------------
+scratch_frame_grabber.diff is against the original 1.0 file, so it shows the
+whole delta since the beginning. To see only what is new to you:
+
+    diff -u scratch_frame_grabber_142.py scratch_frame_grabber.py
+
+One change to your 1.4.2 code
+-----------------------------
+The gallery href was being built from the pattern segments:
+
+    rel_parts = folders + [filename]
+    out_path  = unique_path(os.path.join(out_dir, *rel_parts), self._used_paths)
+    fname     = "/".join(rel_parts)
+
+unique_path can rename the file -- it appends " 2" when two frames in one run
+resolve to the same name -- and fname would still point at the un-renamed
+path, leaving a broken image in the gallery. Now:
+
+    fname = os.path.relpath(out_path, out_dir).replace(os.sep, "/")
+
+Structure
+---------
+_export_construct applies the export filters and hands rendering to
+_render_pairs. The main pass and the unslated pass both go through
+_render_pairs, so the two cannot drift apart in naming, numbering or resize
+handling, and all three run modes share _export_construct and _finish_run.
+
+Worth fixing at the source
+--------------------------
+`shot.audio.roll` is declared a float in Assimilate's OpenAPI spec but is
+genuinely an alphanumeric sound-roll ID -- date-style rolls like "26Y08M22"
+are normal from location sound recorders. The shim added in 1.4.0 stops it
+killing a request, but the spec is where it belongs. Every tool built on that
+SDK has the same landmine.
+
+A diagnostic worth knowing
+--------------------------
+SCRATCH writes the stills itself, so a failed render comes back as
+"409 Can not create file" even when the real cause is offline media. Check
+the shot's .file path before hunting for a permissions or output-folder
+problem.

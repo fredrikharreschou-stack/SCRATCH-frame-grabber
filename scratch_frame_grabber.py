@@ -195,7 +195,15 @@ DEFAULT_SETTINGS = {
     "skip_short": True,
     "min_length": 200,
     "number_prefix": True,
+    "skip_missing_flags": False,
+    "require_flags": "#scene #take",
+    "unslated_subfolder": False,
 }
+
+# Where clips that fail the required-flag check land, when the option to keep
+# them is on. Kept as a constant so the folder name, the gallery title and the
+# log messages can't disagree.
+UNSLATED_DIRNAME = "unslated"
 
 
 def load_settings():
@@ -514,31 +522,6 @@ def sanitize_full_filename(text):
     return cleaned or "shot"
 
 
-PATH_SEPARATORS_RE = re.compile(r"[\\/]+")
-
-
-def render_pattern_segments(rendered):
-    """Split a rendered naming pattern into path segments.
-
-    SCRATCH's own naming/output module treats "\\" (and "/") in a naming
-    pattern as a folder boundary -- e.g. "\\#group\\#construct\\#name"
-    writes into a <group>/<construct>/ subfolder tree instead of one flat
-    folder. Frame Grabber's naming pattern now honors the same
-    convention. Each segment between separators is sanitized on its own
-    -- so a stray character in one folder's name can't leak into the
-    next -- and a leading/doubled separator (patterns SCRATCH itself
-    writes with a leading "\\") just means "nothing there", not an
-    empty-named folder.
-
-    Returns a non-empty list of sanitized segments; the caller treats the
-    last one as the filename and the rest as folders to create.
-    """
-    raw_segments = [s for s in PATH_SEPARATORS_RE.split(rendered) if s.strip(" ._")]
-    if not raw_segments:
-        return ["shot"]
-    return [sanitize_full_filename(s) for s in raw_segments]
-
-
 def pick_snapshot_frame(shot, frame_choice):
     """The ImageSnapshot API's `frame` is a frame number into the shot's
     *source media*, not a position within the timeline -- so frame 0 is
@@ -644,6 +627,50 @@ def build_html_gallery(output_dir, entries, construct_name):
     return gallery_path
 
 
+def parse_flag_list(text):
+    """Pull flag names out of a free-text field.
+
+    Accepts the shapes people actually type -- "#scene #take", "scene, take",
+    "#scene,#take". Returns (known, unknown) as lowercase names, order kept
+    and duplicates dropped, so an unrecognised entry can be reported rather
+    than silently changing what gets skipped.
+    """
+    found = re.findall(r"#?([A-Za-z][A-Za-z0-9]*)", text or "")
+    known, unknown, seen = [], [], set()
+    for name in found:
+        name = name.lower()
+        if name in seen:
+            continue
+        seen.add(name)
+        (known if name in AVAILABLE_FLAGS else unknown).append(name)
+    return known, unknown
+
+
+PATH_SEPARATORS_RE = re.compile(r"[\\/]+")
+
+
+def render_pattern_segments(rendered):
+    """Split a rendered naming pattern into path segments.
+
+    SCRATCH's own naming/output module treats "\\" (and "/") in a naming
+    pattern as a folder boundary -- e.g. "\\#group\\#construct\\#name"
+    writes into a <group>/<construct>/ subfolder tree instead of one flat
+    folder. Frame Grabber's naming pattern now honors the same
+    convention. Each segment between separators is sanitized on its own
+    -- so a stray character in one folder's name can't leak into the
+    next -- and a leading/doubled separator (patterns SCRATCH itself
+    writes with a leading "\\") just means "nothing there", not an
+    empty-named folder.
+
+    Returns a non-empty list of sanitized segments; the caller treats the
+    last one as the filename and the rest as folders to create.
+    """
+    raw_segments = [s for s in PATH_SEPARATORS_RE.split(rendered) if s.strip(" ._")]
+    if not raw_segments:
+        return ["shot"]
+    return [sanitize_full_filename(s) for s in raw_segments]
+
+
 def unique_path(path, taken):
     """Return a path no other frame in THIS run has claimed.
 
@@ -747,7 +774,7 @@ class FrameGrabberApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("SCRATCH Frame Grabber")
-        self.geometry("660x920")
+        self.geometry("660x1000")
         self.minsize(600, 660)
 
         self._setup_window_icon()
@@ -945,13 +972,36 @@ class FrameGrabberApp(ctk.CTk):
         )
         ctk.CTkLabel(short_row, text="frames").pack(side="left")
 
+        # Require certain naming flags to carry data
+        flags_row = ctk.CTkFrame(card, fg_color="transparent")
+        flags_row.grid(row=9, column=0, columnspan=3, sticky="w", padx=(18, 18), pady=(0, 8))
+        self.require_flags_on_var = BooleanVar(value=self.settings.get("skip_missing_flags", False))
+        ctk.CTkCheckBox(
+            flags_row,
+            text="Skip clips missing any of these flags:",
+            variable=self.require_flags_on_var,
+        ).pack(side="left")
+        self.require_flags_var = StringVar(
+            value=self.settings.get("require_flags", "#scene #take")
+        )
+        ctk.CTkEntry(flags_row, textvariable=self.require_flags_var, width=190).pack(
+            side="left", padx=(8, 0)
+        )
+
+        self.unslated_var = BooleanVar(value=self.settings.get("unslated_subfolder", False))
+        ctk.CTkCheckBox(
+            card,
+            text=f"...and keep them in an '{UNSLATED_DIRNAME}' subfolder instead of skipping",
+            variable=self.unslated_var,
+        ).grid(row=10, column=0, columnspan=3, sticky="w", padx=(40, 18), pady=(0, 8))
+
         # HTML gallery of the exported frames
         self.gallery_var = BooleanVar(value=self.settings.get("make_gallery", True))
         ctk.CTkCheckBox(
             card,
             text="Also build an HTML gallery page of the exported frames",
             variable=self.gallery_var,
-        ).grid(row=9, column=0, columnspan=3, sticky="w", padx=(18, 18), pady=(0, 18))
+        ).grid(row=11, column=0, columnspan=3, sticky="w", padx=(18, 18), pady=(0, 18))
 
         # Advanced toggle
         self.adv_toggle = ctk.CTkButton(
@@ -1144,6 +1194,9 @@ class FrameGrabberApp(ctk.CTk):
             "skip_short": bool(self.skip_short_var.get()),
             "min_length": min_length,
             "number_prefix": bool(self.number_prefix_var.get()),
+            "skip_missing_flags": bool(self.require_flags_on_var.get()),
+            "require_flags": self.require_flags_var.get().strip(),
+            "unslated_subfolder": bool(self.unslated_var.get()),
         }
         save_settings(settings)
 
@@ -1268,6 +1321,7 @@ class FrameGrabberApp(ctk.CTk):
     def _grab_frames_inner(self, settings):
         """Grab from the timeline currently open in SCRATCH."""
         self._short_skipped = 0
+        self._missing_flag_skipped = 0
         self._used_paths = set()
         output_dir = os.path.expanduser(settings["output_dir"])
         os.makedirs(output_dir, exist_ok=True)
@@ -1293,12 +1347,20 @@ class FrameGrabberApp(ctk.CTk):
         naming_ctx = self._fetch_naming_context(proj_api)
         flag_sets = (set(), set())
         gallery_entries = []
-        saved, failed, skipped, cancelled, _next = self._export_construct(
+        unslated_entries = []
+        unslated_dir = (
+            os.path.join(output_dir, UNSLATED_DIRNAME)
+            if settings.get("unslated_subfolder") else None
+        )
+        result = self._export_construct(
             app_api, slots, settings, naming_ctx, output_dir, "",
             gallery_entries, flag_sets,
+            unslated_dir=unslated_dir, unslated_entries=unslated_entries,
         )
+        self._build_unslated_gallery(settings, unslated_dir, unslated_entries, naming_ctx[2])
         self._finish_run(settings, output_dir, gallery_entries, naming_ctx[2],
-                         flag_sets, saved, failed, skipped, cancelled)
+                         flag_sets, result["saved"], result["failed"],
+                         result["skipped"], result["cancelled"])
 
     def _grab_project_inner(self, settings, only_group=None):
         """Walk every group and timeline in the open project.
@@ -1312,6 +1374,7 @@ class FrameGrabberApp(ctk.CTk):
         across the group's timelines so the prefixes stay unique.
         """
         self._short_skipped = 0
+        self._missing_flag_skipped = 0
         self._used_paths = set()
         output_dir = os.path.expanduser(settings["output_dir"])
         os.makedirs(output_dir, exist_ok=True)
@@ -1374,6 +1437,12 @@ class FrameGrabberApp(ctk.CTk):
             group_dir = os.path.join(output_dir, group_dirname)
             group_entries = []
             group_index = 0
+            group_unslated_entries = []
+            group_unslated_index = 0
+            group_unslated_dir = (
+                os.path.join(group_dir, UNSLATED_DIRNAME)
+                if settings.get("unslated_subfolder") else None
+            )
             self._log("")
             self._log(f"Group: {gname}  ({len(constructs)} timeline(s))")
 
@@ -1398,15 +1467,20 @@ class FrameGrabberApp(ctk.CTk):
                 # subfolders. Numbering runs on across the group so the NN_
                 # prefixes stay unique, and gallery filenames are bare names
                 # relative to that same folder.
-                s, f, sk, c, group_index = self._export_construct(
+                result = self._export_construct(
                     app_api, slots, settings, naming_ctx,
                     group_dir, "", group_entries, flag_sets,
                     index_offset=group_index,
+                    unslated_dir=group_unslated_dir,
+                    unslated_entries=group_unslated_entries,
+                    unslated_offset=group_unslated_index,
                 )
-                saved += s
-                failed += f
-                skipped += sk
-                if c:
+                group_index = result["next_offset"]
+                group_unslated_index = result["next_unslated_offset"]
+                saved += result["saved"]
+                failed += result["failed"]
+                skipped += result["skipped"]
+                if result["cancelled"]:
                     cancelled = True
                     break
 
@@ -1417,6 +1491,11 @@ class FrameGrabberApp(ctk.CTk):
                     self._log(f"  Gallery for this group: {path}")
                 except Exception as e:
                     self._log(f"  Note: couldn't build the gallery for '{gname}': {e}")
+
+            self._build_unslated_gallery(
+                settings, group_unslated_dir, group_unslated_entries,
+                f"{project_name} -- {gname}" if project_name else gname,
+            )
 
             gallery_entries.extend(
                 {"filename": group_dirname + "/" + entry["filename"],
@@ -1449,64 +1528,41 @@ class FrameGrabberApp(ctk.CTk):
             return
         self._grab_project_inner(settings, only_group=group_name)
 
-    def _export_construct(self, app_api, slots, settings, naming_ctx, out_dir,
-                          rel_prefix, gallery_entries, flag_sets, index_offset=0):
-        """Grab one frame per slot for a single timeline.
+    def _build_unslated_gallery(self, settings, unslated_dir, entries, title):
+        """Contact sheet for the diverted clips, inside their own folder."""
+        if not (settings.get("make_gallery") and unslated_dir and entries):
+            return
+        try:
+            label = f"{title} -- {UNSLATED_DIRNAME}" if title else UNSLATED_DIRNAME
+            path = build_html_gallery(unslated_dir, entries, label)
+            self._log(f"  Gallery for {UNSLATED_DIRNAME}: {path}")
+        except Exception as e:
+            self._log(f"  Note: couldn't build the {UNSLATED_DIRNAME} gallery: {e}")
 
-        Shared by both the open-timeline and whole-project runs so the two
-        can't drift apart. Returns (saved, failed, skipped, cancelled).
-        rel_prefix is prepended to each gallery filename so a gallery page
-        one level up can still find the images.
+    def _render_pairs(self, app_api, pairs, settings, naming_ctx, out_dir,
+                      rel_prefix, gallery_entries, flag_sets, index_offset):
+        """Render one frame for each (slot, shot) into out_dir.
 
-        index_offset continues the NN_ filename numbering from a previous
-        timeline, which is what keeps prefixes unique when several
-        timelines share one group folder. Returns the offset to hand to
-        the next timeline as the fifth value.
+        The main pass and the unslated pass both come through here, so the
+        two can't drift apart in naming, numbering or resize handling.
+        Returns (saved, failed, cancelled, next_offset).
         """
         project_name, group_name, construct_name, record_tc = naming_ctx
         all_unknown, all_unsupported = flag_sets
-
         ext = settings["file_format"].lower()
         if ext not in ("jpg", "png", "tif"):
             ext = "jpg"
         naming_pattern = settings.get("naming_pattern") or DEFAULT_SETTINGS["naming_pattern"]
 
-        pairs = [(slot, (slot.shots or [None])[0]) for slot in slots]
-        skipped = sum(1 for _slot, shot in pairs if shot is None)
-        pairs = [(slot, shot) for slot, shot in pairs if shot is not None]
-
-        # Length first, then last-take. Doing it the other way round would let
-        # a scene whose final take is a false start lose its frame entirely;
-        # this way it falls back to the last take that's actually long enough.
-        minimum = int(settings.get("min_length") or 0) if settings.get("skip_short") else 0
-        if minimum > 0:
-            before = len(pairs)
-            pairs = [
-                (slot, shot) for slot, shot in pairs
-                if not isinstance(getattr(shot, "length", None), int)
-                or shot.length >= minimum
-            ]
-            dropped = before - len(pairs)
-            if dropped:
-                self._short_skipped = getattr(self, "_short_skipped", 0) + dropped
-                self._log(f"    shorter than {minimum} frames: {dropped} clip(s) skipped")
-
-        if settings.get("last_take_only"):
-            before = len(pairs)
-            pairs = select_last_takes(pairs)
-            if before != len(pairs):
-                self._log(f"    last take of each scene: {before} shot(s) -> {len(pairs)}")
-
         if not pairs:
-            return 0, 0, skipped, False, index_offset
+            return 0, 0, False, index_offset
 
         os.makedirs(out_dir, exist_ok=True)
         use_proxy = settings["resolution_mode"] == "proxy"
-        saved = failed = 0
+        saved = failed = consumed = 0
         cancelled = False
         total = len(pairs)
 
-        consumed = 0
         for i, (slot, shot) in enumerate(pairs, start=1):
             if self.cancel_event.is_set():
                 self._log(f"    Cancelled after {i - 1}/{total}.")
@@ -1522,11 +1578,19 @@ class FrameGrabberApp(ctk.CTk):
             rendered, unknown_flags, unsupported_flags = render_naming_pattern(naming_pattern, ctx)
             all_unknown |= unknown_flags
             all_unsupported |= unsupported_flags
-            # A "\" or "/" in the pattern is a folder boundary (matching
-            # SCRATCH's own naming module), so #group\#construct\#name
-            # writes into a <group>/<construct>/ subfolder tree. Only the
-            # last segment is the filename -- everything before it is
-            # folders to create under out_dir.
+            # An unslated clip renders a pattern like #scene_#take as nothing
+            # but its literal separators -- "_" -- which the sanitizer then
+            # strips down to its own "shot" fallback, so every such file would
+            # collide on one name. Test for real characters rather than for an
+            # empty string, and fall back to the clip's own name. Done before
+            # the pattern is split into path segments, so the fallback name
+            # lands in the filename rather than inventing a folder.
+            if not any(ch.isalnum() for ch in rendered):
+                rendered = shot.name or "shot"
+            # A "\" or "/" in the pattern is a folder boundary, matching
+            # SCRATCH's own naming module, so #group\#construct\#name writes
+            # into a <group>/<construct>/ tree. Only the last segment is the
+            # filename; everything before it is folders under out_dir.
             segments = render_pattern_segments(rendered)
             stem = segments[-1]
             folders = segments[:-1]
@@ -1535,23 +1599,21 @@ class FrameGrabberApp(ctk.CTk):
             # day overwrites its stills instead of leaving renumbered orphans.
             if settings.get("number_prefix", True):
                 stem = f"{seq:02d}_{stem}"
-            # The naming pattern may already end with a literal ".#ext" (as
-            # documented -- #ext is meant to be usable inside a pattern).
-            # Only append the extension ourselves when the pattern didn't
-            # already supply one, so a pattern ending in ".#ext" doesn't get
-            # it appended a second time.
+            # The pattern may already end in a literal ".#ext" -- #ext is meant
+            # to be usable inside a pattern -- so only append the extension
+            # when the rendered name doesn't already carry it.
             suffix = f".{ext}"
             filename = stem if stem.lower().endswith(suffix.lower()) else stem + suffix
-            rel_parts = folders + [filename]
             out_path = unique_path(
-                os.path.join(out_dir, *rel_parts),
+                os.path.join(out_dir, *(folders + [filename])),
                 self._used_paths,
             )
             self._used_paths.add(out_path)
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            # Posix-style ("/") even on Windows -- this is a relative href
-            # for the HTML gallery, not a filesystem path.
-            fname = "/".join(rel_parts)
+            # Derive the gallery href from the path we actually wrote. Building
+            # it from the segments instead would go stale whenever unique_path
+            # had to rename the file, leaving a broken image link.
+            fname = os.path.relpath(out_path, out_dir).replace(os.sep, "/")
 
             try:
                 app_api.do_application_render_snapshot(
@@ -1576,7 +1638,121 @@ class FrameGrabberApp(ctk.CTk):
             gallery_entries.append({"filename": rel_prefix + fname, "shot_name": shot.name})
             saved += 1
 
-        return saved, failed, skipped, cancelled, index_offset + consumed
+        return saved, failed, cancelled, index_offset + consumed
+
+    def _export_construct(self, app_api, slots, settings, naming_ctx, out_dir,
+                          rel_prefix, gallery_entries, flag_sets, index_offset=0,
+                          unslated_dir=None, unslated_entries=None, unslated_offset=0):
+        """Grab frames for a single timeline, applying the export filters.
+
+        Shared by all three run modes so they can't drift apart. Returns a
+        dict rather than a tuple -- there are too many counters now for
+        positional results to stay readable.
+
+        index_offset continues the NN_ filename numbering from a previous
+        timeline, which keeps prefixes unique when several timelines share
+        one group folder. unslated_dir, when set, receives the clips that
+        fail the required-flag check instead of dropping them.
+        """
+        project_name, group_name, construct_name, record_tc = naming_ctx
+        ext = settings["file_format"].lower()
+        if ext not in ("jpg", "png", "tif"):
+            ext = "jpg"
+
+        pairs = [(slot, (slot.shots or [None])[0]) for slot in slots]
+        skipped = sum(1 for _slot, shot in pairs if shot is None)
+        pairs = [(slot, shot) for slot, shot in pairs if shot is not None]
+        diverted = []
+
+        # Length first, then last-take. Doing it the other way round would let
+        # a scene whose final take is a false start lose its frame entirely;
+        # this way it falls back to the last take that's actually long enough.
+        minimum = int(settings.get("min_length") or 0) if settings.get("skip_short") else 0
+        if minimum > 0:
+            before = len(pairs)
+            pairs = [
+                (slot, shot) for slot, shot in pairs
+                if not isinstance(getattr(shot, "length", None), int)
+                or shot.length >= minimum
+            ]
+            dropped = before - len(pairs)
+            if dropped:
+                self._short_skipped = getattr(self, "_short_skipped", 0) + dropped
+                self._log(f"    shorter than {minimum} frames: {dropped} clip(s) skipped")
+
+        # Clips whose required flags come back empty -- an unslated clip has no
+        # #scene or #take, media that went offline has no #file. Reuses the
+        # same flag handlers the naming pattern uses.
+        if settings.get("skip_missing_flags") and pairs:
+            required, unrecognised = parse_flag_list(settings.get("require_flags", ""))
+            if unrecognised:
+                self._log(
+                    "    note: ignoring unrecognised flag(s): "
+                    + ", ".join("#" + f for f in unrecognised)
+                )
+            if not required:
+                self._log(
+                    "    note: no recognised flags to require, so nothing was skipped "
+                    "on that basis."
+                )
+            else:
+                kept = []
+                for slot, shot in pairs:
+                    frame = pick_snapshot_frame(shot, settings["frame_choice"])
+                    ctx = build_shot_context(
+                        shot, slot, frame, project_name, group_name,
+                        construct_name, record_tc, ext,
+                    )
+                    if all(
+                        str(AVAILABLE_FLAGS[name](ctx, None) or "").strip()
+                        for name in required
+                    ):
+                        kept.append((slot, shot))
+                    else:
+                        diverted.append((slot, shot))
+                pairs = kept
+                if diverted:
+                    where = "moved to %s/" % UNSLATED_DIRNAME if unslated_dir else "skipped"
+                    self._missing_flag_skipped = getattr(self, "_missing_flag_skipped", 0) + len(diverted)
+                    self._log(
+                        "    missing %s: %d clip(s) %s"
+                        % (" / ".join("#" + f for f in required), len(diverted), where)
+                    )
+
+        if settings.get("last_take_only"):
+            before = len(pairs)
+            pairs = select_last_takes(pairs)
+            if before != len(pairs):
+                self._log(f"    last take of each scene: {before} shot(s) -> {len(pairs)}")
+
+        saved, failed, cancelled, next_offset = self._render_pairs(
+            app_api, pairs, settings, naming_ctx, out_dir, rel_prefix,
+            gallery_entries, flag_sets, index_offset,
+        )
+
+        # The diverted clips go to their own folder with their own numbering
+        # and their own gallery, so the main contact sheet stays clean while
+        # nothing is silently thrown away.
+        unslated_saved = 0
+        next_unslated = unslated_offset
+        if diverted and unslated_dir is not None and unslated_entries is not None and not cancelled:
+            self._log(f"    {len(diverted)} clip(s) -> {UNSLATED_DIRNAME}/")
+            unslated_saved, u_failed, u_cancelled, next_unslated = self._render_pairs(
+                app_api, diverted, settings, naming_ctx, unslated_dir, "",
+                unslated_entries, flag_sets, unslated_offset,
+            )
+            failed += u_failed
+            cancelled = cancelled or u_cancelled
+
+        return {
+            "saved": saved,
+            "failed": failed,
+            "skipped": skipped,
+            "cancelled": cancelled,
+            "next_offset": next_offset,
+            "unslated_saved": unslated_saved,
+            "next_unslated_offset": next_unslated,
+        }
 
     def _finish_run(self, settings, output_dir, gallery_entries, title,
                     flag_sets, saved, failed, skipped, cancelled,
@@ -1607,6 +1783,13 @@ class FrameGrabberApp(ctk.CTk):
         if short_skipped:
             minimum = int(settings.get("min_length") or 0)
             summary += f", {short_skipped} clip(s) under {minimum} frames skipped"
+        missing_flags = getattr(self, "_missing_flag_skipped", 0)
+        if missing_flags:
+            where = (
+                f"moved to {UNSLATED_DIRNAME}/"
+                if settings.get("unslated_subfolder") else "skipped"
+            )
+            summary += f", {missing_flags} clip(s) missing required flags {where}"
         self._log(("Cancelled. " if cancelled else "Done. ") + summary + ".")
         self._log(f"Folder: {output_dir}")
         status = f"Cancelled - {saved} saved" if cancelled else f"Done - {saved} saved"
