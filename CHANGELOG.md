@@ -2,6 +2,59 @@
 
 All notable changes to SCRATCH Frame Grabber are documented here.
 
+## 1.4.6 - 2026-09-08
+
+### Added
+- `#project` in the "Save frames to" path is replaced with the name of the
+  open project, so exports land under a parent folder named for the show:
+  `~/Desktop/scratch_frames/#project` -> `~/Desktop/scratch_frames/Cabin Retreat`.
+  Works with all three grab buttons; the per-group folders are created
+  underneath as before. The substituted name is sanitized, so a project
+  called "Show: Pilot/2" cannot inject a path separator.
+
+  Only `#project` is expanded there, deliberately: the output root is
+  resolved once per run, while `#scene`, `#take` and the rest differ from
+  shot to shot -- those belong in the naming pattern, which has made
+  subfolders from a `\` or `/` since 1.4.2. Any other flag in the output
+  path is left as typed and reported in the log. The project name is only
+  looked up when the path contains a `#`, so ordinary paths cost no extra
+  API call.
+
+- Optional PDF contact sheet alongside the HTML gallery. `contact_sheet.pdf`
+  in each folder that gets a gallery: US Letter portrait, twelve frames a
+  page, shot name under each. Either, both or neither can be switched on.
+  Composed with Pillow, so no new dependency -- Pillow was already required
+  for the custom-width resize.
+
+### Changed
+- Contact sheets, HTML and PDF alike, are now built from the frames present
+  in the folder rather than from the run that just finished. Grabbing one
+  shoot day updates that day's sheets *and* the project-level pair to cover
+  every frame grabbed for the project so far, instead of the project sheet
+  showing whichever day happened to run last. It also self-corrects: a frame
+  you delete stops appearing, where a stored manifest would have gone stale.
+
+  Consequently the project-level sheets are written after every run,
+  including a single-group or single-timeline grab. The previous reason for
+  suppressing them -- that one day's stills would overwrite a whole-project
+  sheet -- no longer applies now that they are rebuilt from the folder. The
+  now-meaningless `write_gallery` parameter has been removed rather than
+  left as a silent no-op.
+
+  Cost: the project PDF is regenerated each run. About 20 seconds at 330
+  frames, 40 at 700. Untick the PDF for quick runs.
+
+- The three gallery-writing sites (project, per-group, unslated) go through
+  one `_write_galleries` helper, so HTML and PDF cannot drift apart.
+
+- The flags help text now mentions that `#project` works in the folder path.
+  The feature was in the previous build but nothing in the UI said so, which
+  made it effectively invisible.
+
+### Note
+- 1.4.4 and 1.4.5 were internal iterations and were never distributed; this
+  entry covers everything since 1.4.3.
+
 ## 1.4.3 - 2026-08-28
 
 Built on 1.4.2. Verified against a live SCRATCH 9.9 (build 1211) on an

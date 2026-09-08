@@ -2,7 +2,7 @@
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 APP_NAME = "SCRATCH Frame Grabber"
-VERSION  = "1.4.3"
+VERSION  = "1.4.6"
 
 datas  = collect_data_files("customtkinter")       # themes + fonts live inside the package
 datas += [("assimilate_logo.png", "."), ("icon_512.png", ".")]

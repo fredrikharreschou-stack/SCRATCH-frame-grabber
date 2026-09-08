@@ -1,4 +1,4 @@
-SCRATCH Frame Grabber for macOS  (1.4.3, Apple Silicon)
+SCRATCH Frame Grabber for macOS  (1.4.6, Apple Silicon)
 =======================================================
 
 INSTALL
@@ -90,6 +90,38 @@ NUMBER FILES IN SHOT ORDER
   left behind. Without it, each shot always maps to the same filename, so
   a re-grab overwrites cleanly. (Measured on one day: re-grabbing after a
   threshold change left 60 files on disk with numbering on, 32 without.)
+
+PROJECT-NAME FOLDER
+  Put #project anywhere in "Save frames to" and it is replaced with the
+  name of the open SCRATCH project:
+
+     /Volumes/CR MASTER/STILLS/#project/frameGrabber
+        ->  /Volumes/CR MASTER/STILLS/Cabin Retreat/frameGrabber
+
+  It works with all three grab buttons, and the group folders a group or
+  project run creates are made underneath it as usual. The name is
+  sanitized, so a project called "Show: Pilot/2" cannot break the path.
+
+  Only #project works here. The output folder is decided once per run,
+  while #scene, #take and the rest change from shot to shot -- those
+  belong in the naming pattern below, which already makes subfolders from
+  a \ or /. Any other flag in the output path is left as typed and noted
+  in the log.
+
+CONTACT SHEETS
+  Two options side by side: an HTML gallery page and a PDF contact sheet.
+  Either, both, or neither. The PDF is US Letter portrait, twelve frames a
+  page, each with its shot name underneath.
+
+  Both are built from what is IN the folder, not from the run that just
+  finished. So grabbing one shoot day updates that day's sheets AND the
+  project-level pair to cover every frame grabbed for the project so far.
+  Delete a frame and it stops appearing; nothing goes stale.
+
+  This means the project sheets are rebuilt after every run, including a
+  single-timeline grab. On a 330-frame project that adds a few seconds;
+  on a 700-frame one the PDF takes about 40 seconds. Untick the PDF for
+  quick runs if that gets in the way.
 
 NAMING
   The naming pattern takes SCRATCH-style #flags, e.g.
