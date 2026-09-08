@@ -27,6 +27,20 @@ path, leaving a broken image in the gallery. Now:
 
     fname = os.path.relpath(out_path, out_dir).replace(os.sep, "/")
 
+Build folders
+-------------
+build-macos/   spec, icon generator and notes for the .app/.dmg. Used for
+               every build so far, so it is known good.
+build-windows/ the same for a Windows .exe, plus a ready-made ten-size
+               icon.ico. WRITTEN ON macOS AND NOT TESTED ON WINDOWS -- it
+               mirrors the macOS spec and should be treated as a starting
+               point. Two things in it are worth reading whatever you use
+               to package: customtkinter needs collect_data_files() or the
+               app dies at launch on a missing theme, and icon.ico has to
+               be bundled as a data file as well as passed to EXE(icon=),
+               because the window icon is loaded at runtime through
+               resource_path().
+
 Structure
 ---------
 _export_construct applies the export filters and hands rendering to

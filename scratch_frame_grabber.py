@@ -84,7 +84,7 @@ def _install_lenient_primitive_deserializer():
 _install_lenient_primitive_deserializer()
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -191,6 +191,7 @@ DEFAULT_SETTINGS = {
     "custom_width": 1920,
     "naming_pattern": "#name",
     "make_gallery": True,
+    "make_pdf": False,
     "last_take_only": False,
     "skip_short": True,
     "min_length": 200,
@@ -646,6 +647,36 @@ def parse_flag_list(text):
     return known, unknown
 
 
+OUTPUT_PATH_FLAG_RE = re.compile(r"#([A-Za-z][A-Za-z0-9]*)")
+
+
+def expand_output_path(path, project_name):
+    """Expand #project in the "Save frames to" path.
+
+    Only a run-level token makes sense here. The output root is resolved once
+    per run, whereas #scene, #take and the rest differ from shot to shot --
+    those belong in the naming pattern, which already creates subfolders from
+    a "\\" or "/". Keeping the two vocabularies apart is what stops
+    "\\#scene" in the root from meaning something different in each mode.
+
+    The substituted name is sanitized, so a project called "Show: Pilot 2"
+    cannot inject a path separator or a character the filesystem rejects.
+
+    Returns (expanded_path, unsupported_flags_used).
+    """
+    unsupported = set()
+
+    def _sub(match):
+        flag = match.group(1).lower()
+        if flag != "project":
+            unsupported.add(flag)
+            return match.group(0)      # left as typed, so the mistake is visible
+        cleaned = safe_filename(project_name) if project_name else ""
+        return cleaned or match.group(0)
+
+    return OUTPUT_PATH_FLAG_RE.sub(_sub, path), unsupported
+
+
 PATH_SEPARATORS_RE = re.compile(r"[\\/]+")
 
 
@@ -669,6 +700,126 @@ def render_pattern_segments(rendered):
     if not raw_segments:
         return ["shot"]
     return [sanitize_full_filename(s) for s in raw_segments]
+
+
+PDF_FILENAME = "contact_sheet.pdf"
+
+# macOS, Windows, then common Linux locations. Falls back to Pillow's builtin
+# bitmap font, which is ugly but never missing.
+PDF_FONT_CANDIDATES = (
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+)
+
+
+def _pdf_font(size):
+    for path in PDF_FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+FRAME_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
+
+
+def collect_existing_frames(root, skip_dirs=(UNSLATED_DIRNAME,)):
+    """Every frame currently sitting under root, newest export included.
+
+    A contact sheet built from the run that just finished only ever shows
+    that run. Grabbing a shoot day at a time would leave the project-level
+    sheet showing whichever day happened to go last. Reading the folder
+    instead means the sheet always reflects everything grabbed for the
+    project so far -- and it self-corrects, because a frame you deleted
+    stops appearing rather than lingering in a stale manifest.
+
+    Returns entries in the same shape build_html_gallery/build_pdf_gallery
+    take, ordered by path so group folders stay together.
+    """
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in skip_dirs)
+        for name in sorted(filenames):
+            if not name.lower().endswith(FRAME_EXTENSIONS):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, name), root)
+            found.append({
+                "filename": rel.replace(os.sep, "/"),
+                "shot_name": os.path.splitext(name)[0],
+            })
+    return found
+
+
+def build_pdf_gallery(output_dir, entries, title, columns=3, rows=4, dpi=150):
+    """A printable contact sheet of the exported frames.
+
+    Composed with Pillow rather than a PDF library, so the app gains no new
+    dependency -- Pillow is already needed for the custom-width resize. Pages
+    are US Letter portrait at 150 dpi, twelve frames to a page, each with its
+    shot name underneath.
+    """
+    page_w, page_h = int(8.5 * dpi), int(11 * dpi)
+    margin = int(0.40 * dpi)
+    header_h = int(0.55 * dpi)
+    gutter = int(0.12 * dpi)
+    caption_h = int(0.18 * dpi)
+
+    cell_w = (page_w - 2 * margin - gutter * (columns - 1)) // columns
+    cell_h = (page_h - 2 * margin - header_h - gutter * (rows - 1)) // rows
+    img_h = cell_h - caption_h
+
+    font_title = _pdf_font(int(0.17 * dpi))
+    font_sub = _pdf_font(int(0.10 * dpi))
+    font_cap = _pdf_font(int(0.085 * dpi))
+
+    per_page = columns * rows
+    total_pages = max(1, (len(entries) + per_page - 1) // per_page)
+    generated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    heading = title or "SCRATCH Frame Grabber"
+
+    def fit(draw, label, width):
+        """Trim a caption to the cell, with an ellipsis when it doesn't fit."""
+        if draw.textlength(label, font=font_cap) <= width:
+            return label
+        while label and draw.textlength(label + "...", font=font_cap) > width:
+            label = label[:-1]
+        return label + "..."
+
+    pages = []
+    for page_index in range(total_pages):
+        page = Image.new("RGB", (page_w, page_h), "white")
+        draw = ImageDraw.Draw(page)
+        draw.text((margin, margin - int(0.10 * dpi)), heading, fill=(20, 20, 20), font=font_title)
+        draw.text(
+            (margin, margin + int(0.12 * dpi)),
+            "%d frame(s)   %s   page %d of %d"
+            % (len(entries), generated, page_index + 1, total_pages),
+            fill=(115, 115, 115), font=font_sub,
+        )
+        for i, entry in enumerate(entries[page_index * per_page:(page_index + 1) * per_page]):
+            col, row = i % columns, i // columns
+            x = margin + col * (cell_w + gutter)
+            y = margin + header_h + row * (cell_h + gutter)
+            try:
+                with Image.open(os.path.join(output_dir, entry["filename"])) as im:
+                    im = im.convert("RGB")
+                    im.thumbnail((cell_w, img_h), Image.LANCZOS)
+                    page.paste(im, (x + (cell_w - im.width) // 2, y + (img_h - im.height) // 2))
+            except Exception:
+                draw.rectangle([x, y, x + cell_w, y + img_h], outline=(205, 205, 205))
+                draw.text((x + 6, y + 6), "missing", fill=(165, 165, 165), font=font_cap)
+            label = entry.get("shot_name") or os.path.basename(entry["filename"])
+            draw.text((x, y + img_h + int(0.035 * dpi)), fit(draw, label, cell_w),
+                      fill=(60, 60, 60), font=font_cap)
+        pages.append(page)
+
+    path = os.path.join(output_dir, PDF_FILENAME)
+    pages[0].save(path, "PDF", resolution=dpi, save_all=True, append_images=pages[1:])
+    return path
 
 
 def unique_path(path, taken):
@@ -944,7 +1095,8 @@ class FrameGrabberApp(ctk.CTk):
             text=(
                 "Uses SCRATCH's own #flag syntax, e.g. #reelid_#scene_#take_#name. Flags\n"
                 "SCRATCH offers that this API can't supply yet are simply left blank. A \\ or /\n"
-                "in the pattern creates subfolders, e.g. \\#group\\#construct\\#name.#ext."
+                "in the pattern creates subfolders, e.g. \\#group\\#construct\\#name.#ext.\n"
+                "In the folder path above, #project stands in for the project name."
             ),
             justify="left",
             font=ctk.CTkFont(size=11),
@@ -995,13 +1147,19 @@ class FrameGrabberApp(ctk.CTk):
             variable=self.unslated_var,
         ).grid(row=10, column=0, columnspan=3, sticky="w", padx=(40, 18), pady=(0, 8))
 
-        # HTML gallery of the exported frames
+        # Contact sheets of the exported frames
+        sheets_row = ctk.CTkFrame(card, fg_color="transparent")
+        sheets_row.grid(row=11, column=0, columnspan=3, sticky="w", padx=(18, 18), pady=(0, 18))
         self.gallery_var = BooleanVar(value=self.settings.get("make_gallery", True))
         ctk.CTkCheckBox(
-            card,
-            text="Also build an HTML gallery page of the exported frames",
+            sheets_row,
+            text="Also build an HTML gallery of the exported frames",
             variable=self.gallery_var,
-        ).grid(row=11, column=0, columnspan=3, sticky="w", padx=(18, 18), pady=(0, 18))
+        ).pack(side="left")
+        self.pdf_var = BooleanVar(value=self.settings.get("make_pdf", False))
+        ctk.CTkCheckBox(
+            sheets_row, text="and a PDF contact sheet", variable=self.pdf_var
+        ).pack(side="left", padx=(14, 0))
 
         # Advanced toggle
         self.adv_toggle = ctk.CTkButton(
@@ -1190,6 +1348,7 @@ class FrameGrabberApp(ctk.CTk):
             "frame_choice": "first" if self.frame_btn.get() == "First frame" else "middle",
             "naming_pattern": self.naming_pattern_var.get().strip() or DEFAULT_SETTINGS["naming_pattern"],
             "make_gallery": bool(self.gallery_var.get()),
+            "make_pdf": bool(self.pdf_var.get()),
             "last_take_only": bool(self.last_take_var.get()),
             "skip_short": bool(self.skip_short_var.get()),
             "min_length": min_length,
@@ -1237,6 +1396,62 @@ class FrameGrabberApp(ctk.CTk):
         self.group_btn.configure(state="normal")
         self.project_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
+
+    def _write_galleries(self, settings, out_dir, title, log_label="Gallery",
+                         skip_dirs=(UNSLATED_DIRNAME,)):
+        """HTML page, PDF contact sheet, or both -- whatever is switched on.
+
+        Contents come from the folder, not from the run that just finished,
+        so a sheet covers everything grabbed for that project or group to
+        date rather than only the latest export.
+        """
+        entries = collect_existing_frames(out_dir, skip_dirs)
+        if not entries:
+            return []
+        made = []
+        if settings.get("make_gallery"):
+            try:
+                made.append(build_html_gallery(out_dir, entries, title))
+            except Exception as e:
+                self._log(f"  Note: couldn't build the HTML gallery: {e}")
+        if settings.get("make_pdf"):
+            if not PIL_AVAILABLE:
+                self._log("  Note: the PDF contact sheet needs Pillow, which isn't installed.")
+            else:
+                try:
+                    made.append(build_pdf_gallery(out_dir, entries, title))
+                except Exception as e:
+                    self._log(f"  Note: couldn't build the PDF contact sheet: {e}")
+        for path in made:
+            self._log(f"  {log_label}: {path}  ({len(entries)} frame(s))")
+        return made
+
+    def _resolve_output_dir(self, settings, proj_api):
+        """Expand #project in the output path, then create the folder.
+
+        The project name is only fetched when the path actually contains a
+        token, so an ordinary path costs no extra API call.
+        """
+        raw = settings["output_dir"]
+        project_name = ""
+        if "#" in raw:
+            project_name = self._lookup_name(
+                proj_api, "get_projects_current", "get_project_current"
+            )
+            if not project_name:
+                self._log("Note: couldn't read the project name -- #project left as typed.")
+        expanded, unsupported = expand_output_path(raw, project_name)
+        if unsupported:
+            self._log(
+                "Note: only #project works in the output folder (the rest belong in the "
+                "naming pattern). Left as typed: "
+                + ", ".join("#" + f for f in sorted(unsupported))
+            )
+        if expanded != raw:
+            self._log(f"Output folder: {expanded}")
+        output_dir = os.path.expanduser(expanded)
+        os.makedirs(output_dir, exist_ok=True)
+        return output_dir
 
     def _make_client(self, settings):
         configuration = assimilate_client.Configuration()
@@ -1323,12 +1538,10 @@ class FrameGrabberApp(ctk.CTk):
         self._short_skipped = 0
         self._missing_flag_skipped = 0
         self._used_paths = set()
-        output_dir = os.path.expanduser(settings["output_dir"])
-        os.makedirs(output_dir, exist_ok=True)
-
         client = self._make_client(settings)
         app_api = assimilate_client.ApplicationApi(client)
         proj_api = assimilate_client.ProjectsApi(client)
+        output_dir = self._resolve_output_dir(settings, proj_api)
 
         try:
             slots_data = proj_api.get_construct_current_slots(level="ALL")
@@ -1358,7 +1571,7 @@ class FrameGrabberApp(ctk.CTk):
             unslated_dir=unslated_dir, unslated_entries=unslated_entries,
         )
         self._build_unslated_gallery(settings, unslated_dir, unslated_entries, naming_ctx[2])
-        self._finish_run(settings, output_dir, gallery_entries, naming_ctx[2],
+        self._finish_run(settings, output_dir, naming_ctx[2],
                          flag_sets, result["saved"], result["failed"],
                          result["skipped"], result["cancelled"])
 
@@ -1376,12 +1589,10 @@ class FrameGrabberApp(ctk.CTk):
         self._short_skipped = 0
         self._missing_flag_skipped = 0
         self._used_paths = set()
-        output_dir = os.path.expanduser(settings["output_dir"])
-        os.makedirs(output_dir, exist_ok=True)
-
         client = self._make_client(settings)
         app_api = assimilate_client.ApplicationApi(client)
         proj_api = assimilate_client.ProjectsApi(client)
+        output_dir = self._resolve_output_dir(settings, proj_api)
 
         try:
             groups_data = proj_api.get_groups(level="ALL")
@@ -1484,13 +1695,12 @@ class FrameGrabberApp(ctk.CTk):
                     cancelled = True
                     break
 
-            if settings.get("make_gallery") and group_entries:
-                try:
-                    title = f"{project_name} -- {gname}" if project_name else gname
-                    path = build_html_gallery(group_dir, group_entries, title)
-                    self._log(f"  Gallery for this group: {path}")
-                except Exception as e:
-                    self._log(f"  Note: couldn't build the gallery for '{gname}': {e}")
+            if group_entries:
+                self._write_galleries(
+                    settings, group_dir,
+                    f"{project_name} -- {gname}" if project_name else gname,
+                    log_label="Gallery for this group",
+                )
 
             self._build_unslated_gallery(
                 settings, group_unslated_dir, group_unslated_entries,
@@ -1507,9 +1717,8 @@ class FrameGrabberApp(ctk.CTk):
         self._log(f"Covered {groups_done} group(s), {constructs_done} timeline(s).")
         # A single-group run must not rewrite the project-wide gallery -- that
         # page belongs to a full run and would be replaced by one day's stills.
-        self._finish_run(settings, output_dir, gallery_entries, project_name,
-                         flag_sets, saved, failed, skipped, cancelled,
-                         write_gallery=(only_group is None))
+        self._finish_run(settings, output_dir, project_name,
+                         flag_sets, saved, failed, skipped, cancelled)
 
     def _grab_group_inner(self, settings):
         """Grab every timeline in the group the open timeline belongs to.
@@ -1530,14 +1739,14 @@ class FrameGrabberApp(ctk.CTk):
 
     def _build_unslated_gallery(self, settings, unslated_dir, entries, title):
         """Contact sheet for the diverted clips, inside their own folder."""
-        if not (settings.get("make_gallery") and unslated_dir and entries):
+        if not (unslated_dir and entries):
             return
-        try:
-            label = f"{title} -- {UNSLATED_DIRNAME}" if title else UNSLATED_DIRNAME
-            path = build_html_gallery(unslated_dir, entries, label)
-            self._log(f"  Gallery for {UNSLATED_DIRNAME}: {path}")
-        except Exception as e:
-            self._log(f"  Note: couldn't build the {UNSLATED_DIRNAME} gallery: {e}")
+        self._write_galleries(
+            settings, unslated_dir,
+            f"{title} -- {UNSLATED_DIRNAME}" if title else UNSLATED_DIRNAME,
+            log_label=f"Gallery for {UNSLATED_DIRNAME}",
+            skip_dirs=(),          # this folder IS the unslated one
+        )
 
     def _render_pairs(self, app_api, pairs, settings, naming_ctx, out_dir,
                       rel_prefix, gallery_entries, flag_sets, index_offset):
@@ -1754,18 +1963,16 @@ class FrameGrabberApp(ctk.CTk):
             "next_unslated_offset": next_unslated,
         }
 
-    def _finish_run(self, settings, output_dir, gallery_entries, title,
-                    flag_sets, saved, failed, skipped, cancelled,
-                    write_gallery=True):
+    def _finish_run(self, settings, output_dir, title,
+                    flag_sets, saved, failed, skipped, cancelled):
         """Gallery, flag notes and the closing summary -- shared by all modes."""
         all_unknown, all_unsupported = flag_sets
 
-        if write_gallery and settings.get("make_gallery") and gallery_entries:
-            try:
-                gallery_path = build_html_gallery(output_dir, gallery_entries, title)
-                self._log(f"Gallery: {gallery_path}")
-            except Exception as e:
-                self._log(f"Note: couldn't build the HTML gallery page: {e}")
+        # Written after every run now, including a single group or timeline.
+        # The old reason for suppressing it -- that one day's stills would
+        # replace a whole-project sheet -- is gone, because the sheet is built
+        # from the folder rather than from this run.
+        self._write_galleries(settings, output_dir, title)
 
         self._log("")
         for flag in sorted(all_unsupported):
